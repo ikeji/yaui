@@ -5,6 +5,9 @@ Usage: yaui-gtk [--debug] SCRIPT [args...]
 
 Same JSON protocol as yaui-tui: SCRIPT writes UI trees to stdout, and reads
 event JSON (one per line) from stdin. This program renders the UI with GTK 3.
+The script's stderr is inherited from this process so its diagnostic output
+appears on the user's terminal as it happens. With --debug, each UI JSON
+tree received from the script is also dumped to stderr.
 """
 
 import argparse
@@ -80,21 +83,19 @@ class Script:
     def __init__(self, argv):
         env = dict(os.environ)
         env['YAUI'] = 'gtk'
+        # stderr is inherited from the parent so the script's diagnostics
+        # appear on the user's terminal in real time.
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
             env=env,
         )
         self.q = queue.Queue()
-        self.stderr_lines = []
         self._t_out = threading.Thread(target=self._read_stdout, daemon=True)
-        self._t_err = threading.Thread(target=self._read_stderr, daemon=True)
         self._t_out.start()
-        self._t_err.start()
 
     def _read_stdout(self):
         try:
@@ -102,13 +103,6 @@ class Script:
                 self.q.put(('ui', obj))
         finally:
             self.q.put(('eof', None))
-
-    def _read_stderr(self):
-        try:
-            for line in self.proc.stderr:
-                self.stderr_lines.append(line.rstrip('\n'))
-        except Exception:
-            pass
 
     def send(self, event):
         try:
@@ -405,6 +399,9 @@ class App:
                 GLib.idle_add(self._quit_when_idle)
                 return
             if kind == 'ui':
+                if self.debug:
+                    sys.stderr.write('[yaui-gtk UI] ' + json.dumps(payload, ensure_ascii=False) + '\n')
+                    sys.stderr.flush()
                 GLib.idle_add(self.apply_ui, payload)
 
     def _quit_when_idle(self):
@@ -425,7 +422,7 @@ def main():
     parser = argparse.ArgumentParser(prog='yaui-gtk',
                                      description=__doc__.splitlines()[0])
     parser.add_argument('--debug', action='store_true',
-                        help='print stderr from the script after exit')
+                        help='dump each UI tree received from the script to stderr')
     parser.add_argument('script', help='path to the shell script (or any executable)')
     parser.add_argument('args', nargs=argparse.REMAINDER,
                         help='arguments passed to the script')
@@ -445,10 +442,6 @@ def main():
     finally:
         script.close_stdin()
         script.terminate()
-        if ns.debug and script.stderr_lines:
-            sys.stderr.write('--- script stderr ---\n')
-            for line in script.stderr_lines:
-                sys.stderr.write(line + '\n')
 
     return script.proc.returncode or 0
 

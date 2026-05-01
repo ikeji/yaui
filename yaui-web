@@ -6,7 +6,10 @@ Usage: yaui-web [--debug] [--port N] [--no-browser] SCRIPT [args...]
 Same JSON protocol as yaui-tui / yaui-gtk. The runtime spawns SCRIPT, opens
 a tiny local HTTP server that serves an HTML+JS client, streams UI updates
 to the browser via Server-Sent Events, and accepts JSON event POSTs back
-to forward to the script's stdin.
+to forward to the script's stdin. The script's stderr is inherited from
+this process so its diagnostic output appears on the user's terminal as
+it happens. With --debug, HTTP requests are logged and each UI JSON tree
+received from the script is dumped to stderr.
 
 Endpoints
 ---------
@@ -87,25 +90,16 @@ class Script:
     def __init__(self, argv):
         env = dict(os.environ)
         env['YAUI'] = 'web'
+        # stderr is inherited from the parent so the script's diagnostics
+        # appear on the user's terminal in real time.
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
             env=env,
         )
-        self.stderr_lines = []
-        self._t_err = threading.Thread(target=self._read_stderr, daemon=True)
-        self._t_err.start()
-
-    def _read_stderr(self):
-        try:
-            for line in self.proc.stderr:
-                self.stderr_lines.append(line.rstrip('\n'))
-        except Exception:
-            pass
 
     def send(self, event):
         try:
@@ -533,7 +527,7 @@ def main():
     parser = argparse.ArgumentParser(prog='yaui-web',
                                      description=__doc__.splitlines()[0])
     parser.add_argument('--debug', action='store_true',
-                        help='log HTTP requests and the script\'s stderr')
+                        help='log HTTP requests and dump each UI tree received from the script to stderr')
     parser.add_argument('--port', type=int, default=0,
                         help='HTTP port (default: pick a free one)')
     parser.add_argument('--no-browser', action='store_true',
@@ -557,6 +551,9 @@ def main():
     def reader():
         try:
             for obj in stream_json_objects(script.proc.stdout):
+                if ns.debug:
+                    sys.stderr.write('[yaui-web UI] ' + json.dumps(obj, ensure_ascii=False) + '\n')
+                    sys.stderr.flush()
                 hub.publish(obj)
         finally:
             hub.shutdown()
@@ -595,11 +592,6 @@ def main():
     hub.shutdown()
     time.sleep(0.2)
     server.shutdown()
-
-    if ns.debug and script.stderr_lines:
-        sys.stderr.write('--- script stderr ---\n')
-        for line in script.stderr_lines:
-            sys.stderr.write(line + '\n')
 
     return rc or 0
 
