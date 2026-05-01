@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""yaui-gtk - GTK runtime for the yaui shell-script UI toolkit.
+
+Usage: yaui-gtk [--debug] SCRIPT [args...]
+
+Same JSON protocol as yaui-tui: SCRIPT writes UI trees to stdout, and reads
+event JSON (one per line) from stdin. This program renders the UI with GTK 3.
+"""
+
+import argparse
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Gdk  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# JSON stream parser (shared protocol with yaui-tui)
+# ---------------------------------------------------------------------------
+
+def stream_json_objects(fileobj):
+    """Yield successive JSON values from a text stream by tracking depth."""
+    buf = []
+    depth = 0
+    in_string = False
+    escape = False
+    started = False
+    while True:
+        ch = fileobj.read(1)
+        if ch == '' or ch is None:
+            return
+        if not started:
+            if ch in (' ', '\t', '\n', '\r'):
+                continue
+            if ch not in ('{', '['):
+                continue
+            started = True
+            buf = [ch]
+            depth = 1
+            in_string = False
+            escape = False
+            continue
+        buf.append(ch)
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in '{[':
+            depth += 1
+        elif ch in '}]':
+            depth -= 1
+            if depth == 0:
+                text = ''.join(buf)
+                try:
+                    yield json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+                buf = []
+                started = False
+
+
+# ---------------------------------------------------------------------------
+# Subprocess wrapper
+# ---------------------------------------------------------------------------
+
+class Script:
+    def __init__(self, argv):
+        env = dict(os.environ)
+        env['YAUI'] = 'gtk'
+        self.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self.q = queue.Queue()
+        self.stderr_lines = []
+        self._t_out = threading.Thread(target=self._read_stdout, daemon=True)
+        self._t_err = threading.Thread(target=self._read_stderr, daemon=True)
+        self._t_out.start()
+        self._t_err.start()
+
+    def _read_stdout(self):
+        try:
+            for obj in stream_json_objects(self.proc.stdout):
+                self.q.put(('ui', obj))
+        finally:
+            self.q.put(('eof', None))
+
+    def _read_stderr(self):
+        try:
+            for line in self.proc.stderr:
+                self.stderr_lines.append(line.rstrip('\n'))
+        except Exception:
+            pass
+
+    def send(self, event):
+        try:
+            self.proc.stdin.write(json.dumps(event, ensure_ascii=False) + '\n')
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def close_stdin(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def terminate(self, timeout=0.5):
+        if self.alive():
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Widget builder
+# ---------------------------------------------------------------------------
+
+def _children(node):
+    c = node.get('children')
+    if c is None:
+        c = node.get('content')
+    if c is None:
+        return []
+    if isinstance(c, list):
+        return c
+    return [c]
+
+
+def _emit(send, base_evt, wid):
+    if wid is not None:
+        base_evt = dict(base_evt)
+        base_evt['id'] = wid
+    send(base_evt)
+
+
+def _item_text(item):
+    if isinstance(item, dict):
+        return str(item.get('text', item.get('label', item.get('value', ''))))
+    return str(item)
+
+
+def build_widget(node, send):
+    if not isinstance(node, dict):
+        return None
+    t = node.get('type')
+    wid = node.get('id')
+
+    if t == 'label':
+        text = str(node.get('text', ''))
+        w = Gtk.Label()
+        if node.get('bold'):
+            w.set_markup('<b>' + GLib.markup_escape_text(text) + '</b>')
+        else:
+            w.set_text(text)
+        w.set_xalign(0.0)
+        w.set_line_wrap(True)
+        return w
+
+    if t == 'button':
+        w = Gtk.Button(label=str(node.get('text', '')))
+        w.connect('clicked', lambda _btn: _emit(send, {'type': 'click'}, wid))
+        return w
+
+    if t == 'checkbox':
+        w = Gtk.CheckButton(label=str(node.get('text', '')))
+        w.set_active(bool(node.get('checked', False)))
+        w.connect('toggled', lambda cb: _emit(send, {'type': 'change', 'value': cb.get_active()}, wid))
+        return w
+
+    if t == 'textbox':
+        w = Gtk.Entry()
+        w.set_text(str(node.get('value', '')))
+        if 'width' in node:
+            try:
+                w.set_width_chars(int(node['width']))
+            except (TypeError, ValueError):
+                pass
+        w.connect('changed', lambda e: _emit(send, {'type': 'change', 'value': e.get_text()}, wid))
+        w.connect('activate', lambda e: _emit(send, {'type': 'submit', 'value': e.get_text()}, wid))
+        return w
+
+    if t == 'textarea':
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        try:
+            cols = int(node.get('width', 30))
+            rows = int(node.get('height', 5))
+        except (TypeError, ValueError):
+            cols, rows = 30, 5
+        sw.set_min_content_width(max(80, cols * 8))
+        sw.set_min_content_height(max(60, rows * 18))
+        tv = Gtk.TextView()
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        buf = tv.get_buffer()
+        buf.set_text(str(node.get('value', '')))
+
+        def on_changed(b):
+            text = b.get_text(b.get_start_iter(), b.get_end_iter(), True)
+            _emit(send, {'type': 'change', 'value': text}, wid)
+        buf.connect('changed', on_changed)
+        sw.add(tv)
+        return sw
+
+    if t == 'progressbar':
+        w = Gtk.ProgressBar()
+        try:
+            v = float(node.get('value', 0))
+            m = float(node.get('max', 100))
+            ratio = max(0.0, min(1.0, v / m if m else 0))
+        except (TypeError, ValueError):
+            ratio = 0.0
+        w.set_fraction(ratio)
+        if node.get('show_text'):
+            w.set_show_text(True)
+        return w
+
+    if t == 'list':
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        try:
+            rows = int(node.get('height', 6))
+        except (TypeError, ValueError):
+            rows = 6
+        sw.set_min_content_height(max(60, rows * 22))
+        sw.set_min_content_width(180)
+        lb = Gtk.ListBox()
+        lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        items = list(node.get('items', []) or [])
+        for i, item in enumerate(items):
+            row = Gtk.ListBoxRow()
+            label = Gtk.Label(label=_item_text(item))
+            label.set_xalign(0.0)
+            label.set_margin_start(6)
+            label.set_margin_end(6)
+            label.set_margin_top(2)
+            label.set_margin_bottom(2)
+            row.add(label)
+            row._yaui_item = item
+            row._yaui_index = i
+            lb.add(row)
+        try:
+            sel = int(node.get('selected', 0) or 0)
+        except (TypeError, ValueError):
+            sel = 0
+        if 0 <= sel < len(items):
+            initial = lb.get_row_at_index(sel)
+            if initial is not None:
+                lb.select_row(initial)
+
+        def on_row_selected(_lb, row):
+            if row is None:
+                return
+            _emit(send, {'type': 'change', 'value': row._yaui_index, 'item': row._yaui_item}, wid)
+
+        def on_row_activated(_lb, row):
+            if row is None:
+                return
+            _emit(send, {'type': 'select', 'value': row._yaui_index, 'item': row._yaui_item}, wid)
+
+        lb.connect('row-selected', on_row_selected)
+        lb.connect('row-activated', on_row_activated)
+        sw.add(lb)
+        return sw
+
+    if t in ('vbox', 'wbox', 'hbox'):
+        orient = (Gtk.Orientation.VERTICAL
+                  if t in ('vbox', 'wbox')
+                  else Gtk.Orientation.HORIZONTAL)
+        spacing = int(node.get('spacing', 6))
+        box = Gtk.Box(orientation=orient, spacing=spacing)
+        for c in _children(node):
+            cw = build_widget(c, send)
+            if cw is None:
+                continue
+            expand = bool(c.get('expand', False)) if isinstance(c, dict) else False
+            box.pack_start(cw, expand, expand, 0)
+        return box
+
+    # Unknown widget type
+    return Gtk.Label(label=f'<unknown widget: {t!r}>')
+
+
+# ---------------------------------------------------------------------------
+# Window/UI application
+# ---------------------------------------------------------------------------
+
+class App:
+    def __init__(self, script, debug=False):
+        self.script = script
+        self.debug = debug
+        self.window = Gtk.Window()
+        self.window.set_default_size(360, 140)
+        self.window.set_title('yaui-gtk')
+        self.window.connect('destroy', self._on_destroy)
+        self.window.connect('key-press-event', self._on_key)
+
+        self._closing = False
+        self._placeholder()
+        self.window.show_all()
+
+    def _placeholder(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_margin_start(12); box.set_margin_end(12)
+        box.set_margin_top(12); box.set_margin_bottom(12)
+        lbl = Gtk.Label(label='yaui-gtk: waiting for UI…')
+        lbl.set_xalign(0.0)
+        box.pack_start(lbl, True, True, 0)
+        self.window.add(box)
+
+    def _replace_child(self, child):
+        old = self.window.get_child()
+        if old is not None:
+            self.window.remove(old)
+        if child is not None:
+            self.window.add(child)
+        self.window.show_all()
+
+    def _on_destroy(self, *_):
+        if not self._closing:
+            self._closing = True
+            self.script.send({'type': 'close'})
+            self.script.close_stdin()
+        Gtk.main_quit()
+
+    def _on_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self._on_destroy()
+            return True
+        return False
+
+    def apply_ui(self, node):
+        if self._closing:
+            return False
+        if isinstance(node, dict) and node.get('type') in ('dialog', 'sdi'):
+            title = node.get('title')
+            if title:
+                self.window.set_title(str(title))
+            contents = _children(node)
+            if not contents:
+                inner = None
+            elif len(contents) == 1:
+                inner = build_widget(contents[0], self.script.send)
+            else:
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                for c in contents:
+                    cw = build_widget(c, self.script.send)
+                    if cw is not None:
+                        inner.pack_start(cw, False, False, 0)
+        else:
+            inner = build_widget(node, self.script.send)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.set_margin_start(12)
+        outer.set_margin_end(12)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
+        if inner is not None:
+            outer.pack_start(inner, True, True, 0)
+        self._replace_child(outer)
+        return False  # for GLib.idle_add (don't repeat)
+
+    def consume(self):
+        """Background thread: pull from script.q, schedule onto GTK main."""
+        while True:
+            try:
+                kind, payload = self.script.q.get(timeout=0.2)
+            except queue.Empty:
+                if not self.script.alive():
+                    GLib.idle_add(self._quit_when_idle)
+                    return
+                continue
+            if kind == 'eof':
+                GLib.idle_add(self._quit_when_idle)
+                return
+            if kind == 'ui':
+                GLib.idle_add(self.apply_ui, payload)
+
+    def _quit_when_idle(self):
+        Gtk.main_quit()
+        return False
+
+    def run(self):
+        t = threading.Thread(target=self.consume, daemon=True)
+        t.start()
+        Gtk.main()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(prog='yaui-gtk',
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument('--debug', action='store_true',
+                        help='print stderr from the script after exit')
+    parser.add_argument('script', help='path to the shell script (or any executable)')
+    parser.add_argument('args', nargs=argparse.REMAINDER,
+                        help='arguments passed to the script')
+    ns = parser.parse_args()
+
+    script_path = ns.script
+    if os.path.exists(script_path) and os.sep not in script_path:
+        script_path = os.path.abspath(script_path)
+    argv = [script_path] + (ns.args or [])
+    if not os.access(script_path, os.X_OK):
+        argv = ['/bin/sh', script_path] + (ns.args or [])
+
+    script = Script(argv)
+    app = App(script, debug=ns.debug)
+    try:
+        app.run()
+    finally:
+        script.close_stdin()
+        script.terminate()
+        if ns.debug and script.stderr_lines:
+            sys.stderr.write('--- script stderr ---\n')
+            for line in script.stderr_lines:
+                sys.stderr.write(line + '\n')
+
+    return script.proc.returncode or 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

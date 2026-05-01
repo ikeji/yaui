@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 _fixture.sh
 _events.log
+_gtk_fixture.sh
+_gtk_events.log
+_gtk_shot.png
+_shot_*.png
