@@ -163,71 +163,220 @@ def _item_text(item):
     return str(item)
 
 
-def build_widget(node, send):
+# Reconciliation: widgets with an `id` are cached and reused across UI
+# updates so their state (Entry text + cursor, focus, ListBox selection)
+# survives. ctx is a dict carrying:
+#   send  - script.send callable
+#   cache - dict[id -> (widget, type)] kept between renders
+#   used  - set of ids referenced this render; entries not in `used` are
+#           destroyed at the end of apply_ui
+
+def build_widget(node, ctx):
     if not isinstance(node, dict):
         return None
     t = node.get('type')
     wid = node.get('id')
 
+    if wid is not None and wid in ctx['cache']:
+        cached_w, cached_t = ctx['cache'][wid]
+        if cached_t == t:
+            ctx['used'].add(wid)
+            _update_widget(cached_w, node, ctx)
+            return cached_w
+        # Type changed under the same id: drop the old widget.
+        cached_w.destroy()
+        del ctx['cache'][wid]
+
+    w = _create_widget(node, ctx)
+    if w is None:
+        return None
+    w._yaui_type = t
+    if wid is not None:
+        ctx['cache'][wid] = (w, t)
+        ctx['used'].add(wid)
+    _update_widget(w, node, ctx)
+    return w
+
+
+def _block(w, attr):
+    hid = getattr(w, attr, None)
+    if hid is not None:
+        w.handler_block(hid)
+
+
+def _unblock(w, attr):
+    hid = getattr(w, attr, None)
+    if hid is not None:
+        w.handler_unblock(hid)
+
+
+def _create_widget(node, ctx):
+    t = node.get('type')
+
     if t == 'label':
-        text = str(node.get('text', ''))
         w = Gtk.Label()
-        if node.get('bold'):
-            w.set_markup('<b>' + GLib.markup_escape_text(text) + '</b>')
-        else:
-            w.set_text(text)
         w.set_xalign(0.0)
         w.set_line_wrap(True)
         return w
 
     if t == 'button':
-        w = Gtk.Button(label=str(node.get('text', '')))
-        w.connect('clicked', lambda _btn: _emit(send, {'type': 'click'}, wid))
+        w = Gtk.Button()
+        w._yaui_clicked_h = w.connect(
+            'clicked',
+            lambda b: _emit(ctx['send'], {'type': 'click'}, b._yaui_id))
         return w
 
     if t == 'checkbox':
-        w = Gtk.CheckButton(label=str(node.get('text', '')))
-        w.set_active(bool(node.get('checked', False)))
-        w.connect('toggled', lambda cb: _emit(send, {'type': 'change', 'value': cb.get_active()}, wid))
+        w = Gtk.CheckButton()
+        w._yaui_toggled_h = w.connect(
+            'toggled',
+            lambda cb: _emit(ctx['send'],
+                             {'type': 'change', 'value': cb.get_active()},
+                             cb._yaui_id))
         return w
 
     if t == 'textbox':
         w = Gtk.Entry()
-        w.set_text(str(node.get('value', '')))
-        if 'width' in node:
-            try:
-                w.set_width_chars(int(node['width']))
-            except (TypeError, ValueError):
-                pass
-        w.connect('changed', lambda e: _emit(send, {'type': 'change', 'value': e.get_text()}, wid))
-        w.connect('activate', lambda e: _emit(send, {'type': 'submit', 'value': e.get_text()}, wid))
+        w._yaui_changed_h = w.connect(
+            'changed',
+            lambda e: _emit(ctx['send'],
+                            {'type': 'change', 'value': e.get_text()},
+                            e._yaui_id))
+        w.connect(
+            'activate',
+            lambda e: _emit(ctx['send'],
+                            {'type': 'submit', 'value': e.get_text()},
+                            e._yaui_id))
         return w
 
     if t == 'textarea':
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.set_shadow_type(Gtk.ShadowType.IN)
+        tv = Gtk.TextView()
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        sw.add(tv)
+        sw._yaui_tv = tv
+        buf = tv.get_buffer()
+
+        def on_changed(b):
+            text = b.get_text(b.get_start_iter(), b.get_end_iter(), True)
+            _emit(ctx['send'], {'type': 'change', 'value': text}, sw._yaui_id)
+        sw._yaui_buf_changed_h = buf.connect('changed', on_changed)
+        return sw
+
+    if t == 'progressbar':
+        w = Gtk.ProgressBar()
+        return w
+
+    if t == 'list':
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        sw.set_min_content_width(180)
+        lb = Gtk.ListBox()
+        lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+
+        def on_row_selected(_lb, row):
+            if row is None:
+                return
+            _emit(ctx['send'],
+                  {'type': 'change',
+                   'value': row._yaui_index,
+                   'item': row._yaui_item},
+                  sw._yaui_id)
+
+        def on_row_activated(_lb, row):
+            if row is None:
+                return
+            _emit(ctx['send'],
+                  {'type': 'select',
+                   'value': row._yaui_index,
+                   'item': row._yaui_item},
+                  sw._yaui_id)
+
+        sw._yaui_row_selected_h = lb.connect('row-selected', on_row_selected)
+        lb.connect('row-activated', on_row_activated)
+        sw.add(lb)
+        sw._yaui_lb = lb
+        return sw
+
+    if t in ('vbox', 'wbox'):
+        return Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                       spacing=int(node.get('spacing', 6)))
+    if t == 'hbox':
+        return Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                       spacing=int(node.get('spacing', 6)))
+
+    return Gtk.Label(label=f'<unknown widget: {t!r}>')
+
+
+def _update_widget(w, node, ctx):
+    t = node.get('type')
+    w._yaui_id = node.get('id')
+
+    if t == 'label':
+        text = str(node.get('text', ''))
+        if node.get('bold'):
+            w.set_markup('<b>' + GLib.markup_escape_text(text) + '</b>')
+        else:
+            w.set_text(text)
+        return
+
+    if t == 'button':
+        w.set_label(str(node.get('text', '')))
+        return
+
+    if t == 'checkbox':
+        w.set_label(str(node.get('text', '')))
+        desired = bool(node.get('checked', False))
+        if w.get_active() != desired:
+            _block(w, '_yaui_toggled_h')
+            w.set_active(desired)
+            _unblock(w, '_yaui_toggled_h')
+        return
+
+    if t == 'textbox':
+        if 'value' in node:
+            new_text = str(node.get('value', ''))
+            if w.get_text() != new_text:
+                # Skip the override while the user is typing in this
+                # field; otherwise async round-trip echo could clobber
+                # letters already entered. `controlled: true` forces it.
+                if node.get('controlled') or not w.has_focus():
+                    pos = w.get_position()
+                    _block(w, '_yaui_changed_h')
+                    w.set_text(new_text)
+                    _unblock(w, '_yaui_changed_h')
+                    w.set_position(min(pos, len(new_text)))
+        if 'width' in node:
+            try:
+                w.set_width_chars(int(node['width']))
+            except (TypeError, ValueError):
+                pass
+        return
+
+    if t == 'textarea':
         try:
             cols = int(node.get('width', 30))
             rows = int(node.get('height', 5))
         except (TypeError, ValueError):
             cols, rows = 30, 5
-        sw.set_min_content_width(max(80, cols * 8))
-        sw.set_min_content_height(max(60, rows * 18))
-        tv = Gtk.TextView()
-        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        buf = tv.get_buffer()
-        buf.set_text(str(node.get('value', '')))
-
-        def on_changed(b):
-            text = b.get_text(b.get_start_iter(), b.get_end_iter(), True)
-            _emit(send, {'type': 'change', 'value': text}, wid)
-        buf.connect('changed', on_changed)
-        sw.add(tv)
-        return sw
+        w.set_min_content_width(max(80, cols * 8))
+        w.set_min_content_height(max(60, rows * 18))
+        if 'value' in node:
+            tv = w._yaui_tv
+            buf = tv.get_buffer()
+            new_text = str(node.get('value', ''))
+            cur_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            if cur_text != new_text:
+                if node.get('controlled') or not tv.has_focus():
+                    buf.handler_block(w._yaui_buf_changed_h)
+                    buf.set_text(new_text)
+                    buf.handler_unblock(w._yaui_buf_changed_h)
+        return
 
     if t == 'progressbar':
-        w = Gtk.ProgressBar()
         try:
             v = float(node.get('value', 0))
             m = float(node.get('max', 100))
@@ -235,75 +384,73 @@ def build_widget(node, send):
         except (TypeError, ValueError):
             ratio = 0.0
         w.set_fraction(ratio)
-        if node.get('show_text'):
-            w.set_show_text(True)
-        return w
+        w.set_show_text(bool(node.get('show_text', False)))
+        return
 
     if t == 'list':
-        sw = Gtk.ScrolledWindow()
-        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        sw.set_shadow_type(Gtk.ShadowType.IN)
         try:
             rows = int(node.get('height', 6))
         except (TypeError, ValueError):
             rows = 6
-        sw.set_min_content_height(max(60, rows * 22))
-        sw.set_min_content_width(180)
-        lb = Gtk.ListBox()
-        lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        w.set_min_content_height(max(60, rows * 22))
         items = list(node.get('items', []) or [])
-        for i, item in enumerate(items):
-            row = Gtk.ListBoxRow()
-            label = Gtk.Label(label=_item_text(item))
-            label.set_xalign(0.0)
-            label.set_margin_start(6)
-            label.set_margin_end(6)
-            label.set_margin_top(2)
-            label.set_margin_bottom(2)
-            row.add(label)
-            row._yaui_item = item
-            row._yaui_index = i
-            lb.add(row)
         try:
-            sel = int(node.get('selected', 0) or 0)
+            sel = int(node.get('selected', -1) if node.get('selected', -1) is not None else -1)
         except (TypeError, ValueError):
-            sel = 0
-        if 0 <= sel < len(items):
-            initial = lb.get_row_at_index(sel)
-            if initial is not None:
-                lb.select_row(initial)
+            sel = -1
+        lb = w._yaui_lb
+        existing = lb.get_children()
 
-        def on_row_selected(_lb, row):
-            if row is None:
-                return
-            _emit(send, {'type': 'change', 'value': row._yaui_index, 'item': row._yaui_item}, wid)
-
-        def on_row_activated(_lb, row):
-            if row is None:
-                return
-            _emit(send, {'type': 'select', 'value': row._yaui_index, 'item': row._yaui_item}, wid)
-
-        lb.connect('row-selected', on_row_selected)
-        lb.connect('row-activated', on_row_activated)
-        sw.add(lb)
-        return sw
+        # Block selection changes during the rebuild so the script
+        # doesn't get a flurry of phantom 'change' events.
+        lb.handler_block(w._yaui_row_selected_h)
+        try:
+            for i, item in enumerate(items):
+                if i < len(existing):
+                    row = existing[i]
+                else:
+                    row = Gtk.ListBoxRow()
+                    label = Gtk.Label()
+                    label.set_xalign(0.0)
+                    label.set_margin_start(6); label.set_margin_end(6)
+                    label.set_margin_top(2);   label.set_margin_bottom(2)
+                    row.add(label)
+                    row._yaui_label = label
+                    lb.add(row)
+                row._yaui_label.set_text(_item_text(item))
+                row._yaui_item = item
+                row._yaui_index = i
+            # Remove any leftover rows.
+            existing = lb.get_children()
+            for row in existing[len(items):]:
+                lb.remove(row)
+            # Apply selection.
+            if 0 <= sel < len(items):
+                target = lb.get_row_at_index(sel)
+                if target is not None and target is not lb.get_selected_row():
+                    lb.select_row(target)
+            elif sel < 0:
+                lb.unselect_all()
+        finally:
+            lb.handler_unblock(w._yaui_row_selected_h)
+        lb.show_all()
+        return
 
     if t in ('vbox', 'wbox', 'hbox'):
-        orient = (Gtk.Orientation.VERTICAL
-                  if t in ('vbox', 'wbox')
-                  else Gtk.Orientation.HORIZONTAL)
-        spacing = int(node.get('spacing', 6))
-        box = Gtk.Box(orientation=orient, spacing=spacing)
-        for c in _children(node):
-            cw = build_widget(c, send)
+        kids = _children(node)
+        existing = w.get_children()
+        # Detach any cached descendants (they may move) so we can re-pack.
+        for child in existing:
+            w.remove(child)
+        for c in kids:
+            cw = build_widget(c, ctx)
             if cw is None:
                 continue
             expand = bool(c.get('expand', False)) if isinstance(c, dict) else False
-            box.pack_start(cw, expand, expand, 0)
-        return box
+            w.pack_start(cw, expand, expand, 0)
+        return
 
-    # Unknown widget type
-    return Gtk.Label(label=f'<unknown widget: {t!r}>')
+    # unknown — leave label as-is
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +468,7 @@ class App:
         self.window.connect('key-press-event', self._on_key)
 
         self._closing = False
+        self._idmap = {}  # id -> (widget, type), persisted across renders
         self._placeholder()
         self.window.show_all()
 
@@ -357,6 +505,28 @@ class App:
     def apply_ui(self, node):
         if self._closing:
             return False
+
+        # Capture which cached widget currently has focus, so we can
+        # restore it after the rebuild.
+        focus_id = None
+        focused = self.window.get_focus()
+        if focused is not None:
+            for k, (cw, _) in self._idmap.items():
+                if cw is focused or focused.is_ancestor(cw):
+                    focus_id = k
+                    break
+
+        # Detach every cached widget from its current parent so build_widget
+        # can re-attach reused ones into new containers without GTK
+        # complaining about double parents.
+        for cw, _ in self._idmap.values():
+            parent = cw.get_parent()
+            if parent is not None:
+                parent.remove(cw)
+
+        used = set()
+        ctx = {'send': self.script.send, 'cache': self._idmap, 'used': used}
+
         if isinstance(node, dict) and node.get('type') in ('dialog', 'sdi'):
             title = node.get('title')
             if title:
@@ -365,15 +535,21 @@ class App:
             if not contents:
                 inner = None
             elif len(contents) == 1:
-                inner = build_widget(contents[0], self.script.send)
+                inner = build_widget(contents[0], ctx)
             else:
                 inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
                 for c in contents:
-                    cw = build_widget(c, self.script.send)
+                    cw = build_widget(c, ctx)
                     if cw is not None:
                         inner.pack_start(cw, False, False, 0)
         else:
-            inner = build_widget(node, self.script.send)
+            inner = build_widget(node, ctx)
+
+        # Drop cached entries that aren't referenced any more.
+        for k in list(self._idmap.keys()):
+            if k not in used:
+                widget, _ = self._idmap.pop(k)
+                widget.destroy()
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_margin_start(12)
@@ -383,6 +559,11 @@ class App:
         if inner is not None:
             outer.pack_start(inner, True, True, 0)
         self._replace_child(outer)
+
+        if focus_id is not None and focus_id in self._idmap:
+            cw, _ = self._idmap[focus_id]
+            target = getattr(cw, '_yaui_lb', None) or getattr(cw, '_yaui_tv', None) or cw
+            target.grab_focus()
         return False  # for GLib.idle_add (don't repeat)
 
     def consume(self):

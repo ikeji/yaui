@@ -249,122 +249,213 @@ function itemText(item) {
   return String(item);
 }
 
-function build(node) {
+// Reconciliation: keep DOM nodes alive across renders so that input
+// elements preserve focus and cursor position. Position-based matching
+// (same index, same type) plus id matching, à la React.
+
+function nodeId(n)   { return (n && typeof n === 'object') ? n.id   : undefined; }
+function nodeType(n) { return (n && typeof n === 'object') ? n.type : undefined; }
+
+// Reuse `existing` if compatible with the new node, otherwise build fresh.
+function ensure(existing, node) {
   if (!node || typeof node !== 'object') return null;
   const t = node.type;
-  const id = node.id;
-
-  if (t === 'label') {
-    const el = document.createElement('div');
-    el.className = 'yaui-label' + (node.bold ? ' bold' : '');
-    el.textContent = String(node.text ?? '');
-    return el;
-  }
-  if (t === 'button') {
-    const el = document.createElement('button');
-    el.className = 'yaui-button';
-    el.textContent = String(node.text ?? '');
-    el.addEventListener('click', () => emit({type: 'click'}, id));
-    return el;
-  }
-  if (t === 'checkbox') {
-    const lbl = document.createElement('label');
-    lbl.className = 'yaui-checkbox';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = !!node.checked;
-    cb.addEventListener('change', () => emit({type: 'change', value: cb.checked}, id));
-    lbl.appendChild(cb);
-    lbl.appendChild(document.createTextNode(' ' + String(node.text ?? '')));
-    return lbl;
-  }
-  if (t === 'textbox') {
-    const el = document.createElement('input');
-    el.type = 'text';
-    el.className = 'yaui-textbox';
-    el.value = String(node.value ?? '');
-    if (node.width) el.size = node.width;
-    el.addEventListener('input', () => emit({type: 'change', value: el.value}, id));
-    el.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') emit({type: 'submit', value: el.value}, id);
-    });
-    return el;
-  }
-  if (t === 'textarea') {
-    const el = document.createElement('textarea');
-    el.className = 'yaui-textarea';
-    if (node.width) el.cols = node.width;
-    if (node.height) el.rows = node.height;
-    el.value = String(node.value ?? '');
-    el.addEventListener('input', () => emit({type: 'change', value: el.value}, id));
-    return el;
-  }
-  if (t === 'progressbar') {
-    const el = document.createElement('progress');
-    el.className = 'yaui-progress';
-    const max = Number(node.max ?? 100);
-    const v = Number(node.value ?? 0);
-    el.max = max || 100;
-    el.value = isFinite(v) ? v : 0;
-    return el;
-  }
-  if (t === 'list') {
-    const el = document.createElement('ul');
-    el.className = 'yaui-list';
-    const items = node.items || [];
-    const sel = Number(node.selected ?? 0);
-    items.forEach((item, idx) => {
-      const li = document.createElement('li');
-      li.textContent = itemText(item);
-      if (idx === sel) li.classList.add('selected');
-      li.addEventListener('click', () => {
-        el.querySelectorAll('li.selected').forEach(n => n.classList.remove('selected'));
-        li.classList.add('selected');
-        emit({type: 'change', value: idx, item: item}, id);
-      });
-      li.addEventListener('dblclick', () => emit({type: 'select', value: idx, item: item}, id));
-      el.appendChild(li);
-    });
-    return el;
-  }
-  if (t === 'vbox' || t === 'wbox' || t === 'hbox') {
-    const el = document.createElement('div');
-    el.className = (t === 'hbox') ? 'yaui-hbox' : 'yaui-vbox';
-    for (const c of children(node)) {
-      const cw = build(c);
-      if (cw) el.appendChild(cw);
-    }
-    return el;
-  }
-  if (t === 'dialog' || t === 'sdi') {
-    const el = document.createElement('div');
-    el.className = 'yaui-dialog';
-    if (node.title) {
-      document.title = String(node.title);
-      const tt = document.createElement('div');
-      tt.className = 'yaui-title';
-      tt.textContent = String(node.title);
-      el.appendChild(tt);
-    }
-    const inner = document.createElement('div');
-    inner.className = 'yaui-vbox';
-    for (const c of children(node)) {
-      const cw = build(c);
-      if (cw) inner.appendChild(cw);
-    }
-    el.appendChild(inner);
-    return el;
-  }
-  const el = document.createElement('div');
-  el.className = 'yaui-unknown';
-  el.textContent = '<unknown widget: ' + JSON.stringify(t) + '>';
+  const reusable = existing
+    && existing._yauiType === t
+    && (existing._yauiId === undefined || existing._yauiId === node.id);
+  let el = reusable ? existing : create(node);
+  if (!el) return null;
+  el._yauiType = t;
+  el._yauiId = node.id;
+  el._yauiNode = node;
+  update(el, node);
   return el;
 }
 
+// Walk newKids in lock-step with parent.children, reusing existing slots.
+function reconcileChildren(parent, newKids) {
+  const desired = [];
+  for (let i = 0; i < newKids.length; i++) {
+    const slot = parent.children[i] || null;
+    const child = ensure(slot, newKids[i]);
+    if (child) desired.push(child);
+  }
+  // Apply: replace slots that changed identity, append/remove tail.
+  for (let i = 0; i < desired.length; i++) {
+    const slot = parent.children[i] || null;
+    if (desired[i] !== slot) {
+      if (slot) parent.replaceChild(desired[i], slot);
+      else parent.appendChild(desired[i]);
+    }
+  }
+  while (parent.children.length > desired.length) {
+    parent.removeChild(parent.lastChild);
+  }
+}
+
+// Create a bare element of the right kind, with handlers that read
+// the latest node from el._yauiNode (set by ensure on every update).
+function create(node) {
+  const t = node.type;
+  let el;
+  if (t === 'label') {
+    el = document.createElement('div');
+    el.className = 'yaui-label';
+  } else if (t === 'button') {
+    el = document.createElement('button');
+    el.className = 'yaui-button';
+    el.addEventListener('click',
+      () => emit({type: 'click'}, el._yauiNode.id));
+  } else if (t === 'checkbox') {
+    el = document.createElement('label');
+    el.className = 'yaui-checkbox';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    const txt = document.createTextNode('');
+    cb.addEventListener('change',
+      () => emit({type: 'change', value: cb.checked}, el._yauiNode.id));
+    el.appendChild(cb);
+    el.appendChild(txt);
+    el._yauiCb = cb;
+    el._yauiTxt = txt;
+  } else if (t === 'textbox') {
+    el = document.createElement('input');
+    el.type = 'text';
+    el.className = 'yaui-textbox';
+    el.addEventListener('input',
+      () => emit({type: 'change', value: el.value}, el._yauiNode.id));
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') emit({type: 'submit', value: el.value}, el._yauiNode.id);
+    });
+  } else if (t === 'textarea') {
+    el = document.createElement('textarea');
+    el.className = 'yaui-textarea';
+    el.addEventListener('input',
+      () => emit({type: 'change', value: el.value}, el._yauiNode.id));
+  } else if (t === 'progressbar') {
+    el = document.createElement('progress');
+    el.className = 'yaui-progress';
+  } else if (t === 'list') {
+    el = document.createElement('ul');
+    el.className = 'yaui-list';
+  } else if (t === 'vbox' || t === 'wbox') {
+    el = document.createElement('div');
+    el.className = 'yaui-vbox';
+  } else if (t === 'hbox') {
+    el = document.createElement('div');
+    el.className = 'yaui-hbox';
+  } else if (t === 'dialog' || t === 'sdi') {
+    el = document.createElement('div');
+    el.className = 'yaui-dialog';
+    const tt = document.createElement('div');
+    tt.className = 'yaui-title';
+    const inner = document.createElement('div');
+    inner.className = 'yaui-vbox';
+    el._yauiTitle = tt;
+    el._yauiInner = inner;
+    el.appendChild(tt);
+    el.appendChild(inner);
+  } else {
+    el = document.createElement('div');
+    el.className = 'yaui-unknown';
+  }
+  return el;
+}
+
+function update(el, node) {
+  const t = node.type;
+  if (t === 'label') {
+    el.classList.toggle('bold', !!node.bold);
+    const text = String(node.text ?? '');
+    if (el.textContent !== text) el.textContent = text;
+  } else if (t === 'button') {
+    const text = String(node.text ?? '');
+    if (el.textContent !== text) el.textContent = text;
+  } else if (t === 'checkbox') {
+    const desired = !!node.checked;
+    if (el._yauiCb.checked !== desired) el._yauiCb.checked = desired;
+    el._yauiTxt.nodeValue = ' ' + String(node.text ?? '');
+  } else if (t === 'textbox') {
+    if (node.value !== undefined) {
+      const v = String(node.value);
+      // Skip set when equal (cursor preserved); also skip when this
+      // input has focus and the script just echoed the value back —
+      // otherwise fast typing during async round-trip would clobber
+      // letters the user has already entered. `controlled: true`
+      // forces the override.
+      if (el.value !== v &&
+          (node.controlled || document.activeElement !== el)) {
+        el.value = v;
+      }
+    }
+    if (node.width && el.size !== node.width) el.size = node.width;
+  } else if (t === 'textarea') {
+    if (node.value !== undefined) {
+      const v = String(node.value);
+      if (el.value !== v &&
+          (node.controlled || document.activeElement !== el)) {
+        el.value = v;
+      }
+    }
+    if (node.width && el.cols !== node.width)  el.cols = node.width;
+    if (node.height && el.rows !== node.height) el.rows = node.height;
+  } else if (t === 'progressbar') {
+    const max = Number(node.max ?? 100) || 100;
+    const v = Number(node.value ?? 0);
+    if (el.max !== max) el.max = max;
+    const nv = isFinite(v) ? v : 0;
+    if (el.value !== nv) el.value = nv;
+  } else if (t === 'list') {
+    const items = node.items || [];
+    const sel = Number(node.selected ?? -1);
+    while (el.children.length < items.length) {
+      const li = document.createElement('li');
+      li.addEventListener('click', () => {
+        emit({type: 'change', value: li._yauiIndex, item: li._yauiItem}, el._yauiNode.id);
+      });
+      li.addEventListener('dblclick', () => {
+        emit({type: 'select', value: li._yauiIndex, item: li._yauiItem}, el._yauiNode.id);
+      });
+      el.appendChild(li);
+    }
+    while (el.children.length > items.length) el.removeChild(el.lastChild);
+    for (let i = 0; i < items.length; i++) {
+      const li = el.children[i];
+      const text = itemText(items[i]);
+      if (li.textContent !== text) li.textContent = text;
+      li._yauiItem = items[i];
+      li._yauiIndex = i;
+      li.classList.toggle('selected', i === sel);
+    }
+  } else if (t === 'vbox' || t === 'wbox') {
+    el.className = 'yaui-vbox';
+    reconcileChildren(el, children(node));
+  } else if (t === 'hbox') {
+    el.className = 'yaui-hbox';
+    reconcileChildren(el, children(node));
+  } else if (t === 'dialog' || t === 'sdi') {
+    if (node.title) {
+      const text = String(node.title);
+      document.title = text;
+      if (el._yauiTitle.textContent !== text) el._yauiTitle.textContent = text;
+      if (!el._yauiTitle.parentElement) el.insertBefore(el._yauiTitle, el._yauiInner);
+    } else if (el._yauiTitle.parentElement) {
+      el.removeChild(el._yauiTitle);
+    }
+    reconcileChildren(el._yauiInner, children(node));
+  } else {
+    el.textContent = '<unknown widget: ' + JSON.stringify(t) + '>';
+  }
+}
+
 function render(ui) {
-  $root.innerHTML = '';
-  const node = build(ui);
-  if (node) $root.appendChild(node);
+  const slot = $root.firstElementChild || null;
+  const child = ensure(slot, ui);
+  if (!child) return;
+  if (child !== slot) {
+    if (slot) $root.replaceChild(child, slot);
+    else $root.appendChild(child);
+  }
 }
 
 const evt = new EventSource('/events');

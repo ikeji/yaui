@@ -51,10 +51,19 @@
 
 ### 状態保持の方針の違い
 
-- **TUI**: ウィジェットインスタンスは毎回作り直すが、状態（`text`, `cursor`, `checked`, `index`, `lines`）は `StateStore` が `id` をキーに保持する。UI ツリーで `value` を渡しても、`controlled: true` でない限り無視される。
-- **GTK / Web**: 全再構築。ユーザー入力を保つには、スクリプト側で `change` イベントを捕捉してから次回の UI ツリーに `value` として echo back する。これは React の controlled input と同じ思想。
+3 ランタイムとも、新しい UI ツリーを受信するたびに「id ベースの reconciliation」で既存ノードを再利用する。
 
-ただし全再描画は、textbox/textarea の打鍵ごとにやるとカーソルが先頭へ飛ぶ。デモは「打鍵時の `change` では変数だけ更新して再エミットしない」「ボタン押下や選択など、別のイベントで再エミット」というパターンを採用している（`showcase.sh` 参照）。
+- **TUI**: ウィジェットインスタンスは毎回作り直すが、状態（`text`, `cursor`, `checked`, `index`, `lines`）は `StateStore` が `id` をキーに保持する。UI ツリーで `value` を渡しても、`controlled: true` でない限り無視される。
+- **GTK**: `App._idmap` が `id → (widget, type)` をフレームをまたいで保持。`apply_ui` の冒頭でキャッシュ済みウィジェットを全 `unparent`、新しい木の中で再 attach。Entry の `set_text` は signal を block して呼び出し、`get_position()` で位置を保存→`set_position(min(pos, len(new)))` で復元する。フレーム終了時に未参照になった id は `destroy()`。`get_focus()` で旧 focus 位置を id 単位で記録し、再描画後に `grab_focus()` で復元。
+- **Web**: `ensure(existing, node)` が `(_yauiType, _yauiId)` で再利用判定。`reconcileChildren` は親 DOM 内のスロットを順番に更新／追加／削除（React の position-based reconciliation 風）。
+
+textbox/textarea の `value` 上書きには共通ルール:
+1. 新値 == 現在値 → 何もしない（カーソル維持）
+2. 新値 ≠ 現在値かつ focus 中 → 何もしない（typeahead で打鍵中に script の echo back が既入力を消す race の回避）
+3. focus が無ければ上書き
+4. `node.controlled === true` なら 2 を無視して常に上書き
+
+`launcher.sh` がこの不変条件を要求する典型例（dmenu_path 風: 入力でフィルタ、Enter で実行）。
 
 ### stderr の扱い
 

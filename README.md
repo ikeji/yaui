@@ -34,6 +34,7 @@ read line   # stdin にイベントが届くまで待つ
 | `counter.sh`   | ボタンでカウントアップ                               |
 | `monitor.sh`   | 時刻 / CPU / メモリ / ディスクをライブ表示           |
 | `showcase.sh`  | 全ウィジェットを 1 ダイアログに集めたデモ            |
+| `launcher.sh`  | dmenu_path 風: PATH 上の実行可能ファイルを絞り込み実行 |
 | `PROTOCOL.md`  | UI ツリーとイベントの仕様                            |
 | `AGENT.md`     | 開発ノート（ランタイムの構成・実装上の注意点）       |
 | `idea.md`      | 設計の出発点メモ                                     |
