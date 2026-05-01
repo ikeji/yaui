@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""yaui-web - browser runtime for the yaui shell-script UI toolkit.
+
+Usage: yaui-web [--debug] [--port N] [--no-browser] SCRIPT [args...]
+
+Same JSON protocol as yaui-tui / yaui-gtk. The runtime spawns SCRIPT, opens
+a tiny local HTTP server that serves an HTML+JS client, streams UI updates
+to the browser via Server-Sent Events, and accepts JSON event POSTs back
+to forward to the script's stdin.
+
+Endpoints
+---------
+GET  /         HTML page with the JS renderer
+GET  /events   SSE stream of UI JSON; the latest tree is replayed on connect
+POST /event    body is one event JSON object; relayed to the script's stdin
+"""
+
+import argparse
+import json
+import os
+import queue
+import socket
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+# ---------------------------------------------------------------------------
+# JSON stream parser (shared protocol with yaui-tui / yaui-gtk)
+# ---------------------------------------------------------------------------
+
+def stream_json_objects(fileobj):
+    buf = []
+    depth = 0
+    in_string = False
+    escape = False
+    started = False
+    while True:
+        ch = fileobj.read(1)
+        if ch == '' or ch is None:
+            return
+        if not started:
+            if ch in (' ', '\t', '\n', '\r'):
+                continue
+            if ch not in ('{', '['):
+                continue
+            started = True
+            buf = [ch]
+            depth = 1
+            in_string = False
+            escape = False
+            continue
+        buf.append(ch)
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in '{[':
+            depth += 1
+        elif ch in '}]':
+            depth -= 1
+            if depth == 0:
+                text = ''.join(buf)
+                try:
+                    yield json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+                buf = []
+                started = False
+
+
+# ---------------------------------------------------------------------------
+# Subprocess wrapper
+# ---------------------------------------------------------------------------
+
+class Script:
+    def __init__(self, argv):
+        env = dict(os.environ)
+        env['YAUI'] = 'web'
+        self.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self.stderr_lines = []
+        self._t_err = threading.Thread(target=self._read_stderr, daemon=True)
+        self._t_err.start()
+
+    def _read_stderr(self):
+        try:
+            for line in self.proc.stderr:
+                self.stderr_lines.append(line.rstrip('\n'))
+        except Exception:
+            pass
+
+    def send(self, event):
+        try:
+            self.proc.stdin.write(json.dumps(event, ensure_ascii=False) + '\n')
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def close_stdin(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def terminate(self, timeout=0.5):
+        if self.alive():
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Hub: fan out script UI updates to all SSE subscribers
+# ---------------------------------------------------------------------------
+
+class Hub:
+    """Broadcasts UI updates to every connected SSE subscriber.
+
+    Late subscribers immediately receive the most recent UI tree (so that
+    refreshing the page works) and any further updates as they arrive.
+    """
+    SENTINEL_EOF = object()
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._subs = []  # list[queue.Queue]
+        self._latest = None  # last UI JSON or None
+
+    def subscribe(self):
+        q = queue.Queue()
+        with self._lock:
+            self._subs.append(q)
+            latest = self._latest
+        if latest is not None:
+            q.put(latest)
+        return q
+
+    def unsubscribe(self, q):
+        with self._lock:
+            try:
+                self._subs.remove(q)
+            except ValueError:
+                pass
+
+    def publish(self, ui_json):
+        with self._lock:
+            self._latest = ui_json
+            subs = list(self._subs)
+        for q in subs:
+            q.put(ui_json)
+
+    def shutdown(self):
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            q.put(self.SENTINEL_EOF)
+
+
+# ---------------------------------------------------------------------------
+# HTML/JS client (served at /)
+# ---------------------------------------------------------------------------
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>yaui-web</title>
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; padding: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { padding: 24px; }
+  .yaui-dialog { border: 1px solid #888; border-radius: 6px; padding: 16px; max-width: 720px;
+                 background: Canvas; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .yaui-dialog > .yaui-title { font-weight: 600; margin: -8px -8px 12px; padding: 6px 8px;
+                               border-bottom: 1px solid #ccc; }
+  .yaui-vbox { display: flex; flex-direction: column; gap: 8px; }
+  .yaui-hbox { display: flex; flex-direction: row; gap: 8px; align-items: center; }
+  .yaui-label { white-space: pre-wrap; }
+  .yaui-label.bold { font-weight: 600; }
+  .yaui-button { padding: 6px 14px; cursor: pointer; }
+  .yaui-textbox { padding: 4px 6px; min-width: 12ch; }
+  .yaui-textarea { padding: 6px; font-family: inherit; resize: vertical; }
+  .yaui-list { border: 1px solid #aaa; border-radius: 4px; padding: 0; margin: 0; list-style: none;
+               max-height: 240px; overflow: auto; min-width: 200px; }
+  .yaui-list li { padding: 4px 8px; cursor: pointer; }
+  .yaui-list li.selected { background: SelectedItem; color: SelectedItemText; }
+  .yaui-progress { width: 100%; height: 18px; }
+  .yaui-status { color: #888; font-size: 12px; margin-top: 16px; }
+  .yaui-unknown { color: #c00; font-family: monospace; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div class="yaui-status" id="status">connecting…</div>
+<script>
+"use strict";
+const $root = document.getElementById('root');
+const $status = document.getElementById('status');
+
+function send(event) {
+  fetch('/event', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(event),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+function emit(base, id) {
+  const e = Object.assign({}, base);
+  if (id !== undefined && id !== null) e.id = id;
+  send(e);
+}
+
+function children(node) {
+  let c = node.children;
+  if (c === undefined) c = node.content;
+  if (c === undefined) return [];
+  return Array.isArray(c) ? c : [c];
+}
+
+function itemText(item) {
+  if (item && typeof item === 'object') {
+    return String(item.text ?? item.label ?? item.value ?? '');
+  }
+  return String(item);
+}
+
+function build(node) {
+  if (!node || typeof node !== 'object') return null;
+  const t = node.type;
+  const id = node.id;
+
+  if (t === 'label') {
+    const el = document.createElement('div');
+    el.className = 'yaui-label' + (node.bold ? ' bold' : '');
+    el.textContent = String(node.text ?? '');
+    return el;
+  }
+  if (t === 'button') {
+    const el = document.createElement('button');
+    el.className = 'yaui-button';
+    el.textContent = String(node.text ?? '');
+    el.addEventListener('click', () => emit({type: 'click'}, id));
+    return el;
+  }
+  if (t === 'checkbox') {
+    const lbl = document.createElement('label');
+    lbl.className = 'yaui-checkbox';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!node.checked;
+    cb.addEventListener('change', () => emit({type: 'change', value: cb.checked}, id));
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(' ' + String(node.text ?? '')));
+    return lbl;
+  }
+  if (t === 'textbox') {
+    const el = document.createElement('input');
+    el.type = 'text';
+    el.className = 'yaui-textbox';
+    el.value = String(node.value ?? '');
+    if (node.width) el.size = node.width;
+    el.addEventListener('input', () => emit({type: 'change', value: el.value}, id));
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') emit({type: 'submit', value: el.value}, id);
+    });
+    return el;
+  }
+  if (t === 'textarea') {
+    const el = document.createElement('textarea');
+    el.className = 'yaui-textarea';
+    if (node.width) el.cols = node.width;
+    if (node.height) el.rows = node.height;
+    el.value = String(node.value ?? '');
+    el.addEventListener('input', () => emit({type: 'change', value: el.value}, id));
+    return el;
+  }
+  if (t === 'progressbar') {
+    const el = document.createElement('progress');
+    el.className = 'yaui-progress';
+    const max = Number(node.max ?? 100);
+    const v = Number(node.value ?? 0);
+    el.max = max || 100;
+    el.value = isFinite(v) ? v : 0;
+    return el;
+  }
+  if (t === 'list') {
+    const el = document.createElement('ul');
+    el.className = 'yaui-list';
+    const items = node.items || [];
+    const sel = Number(node.selected ?? 0);
+    items.forEach((item, idx) => {
+      const li = document.createElement('li');
+      li.textContent = itemText(item);
+      if (idx === sel) li.classList.add('selected');
+      li.addEventListener('click', () => {
+        el.querySelectorAll('li.selected').forEach(n => n.classList.remove('selected'));
+        li.classList.add('selected');
+        emit({type: 'change', value: idx, item: item}, id);
+      });
+      li.addEventListener('dblclick', () => emit({type: 'select', value: idx, item: item}, id));
+      el.appendChild(li);
+    });
+    return el;
+  }
+  if (t === 'vbox' || t === 'wbox' || t === 'hbox') {
+    const el = document.createElement('div');
+    el.className = (t === 'hbox') ? 'yaui-hbox' : 'yaui-vbox';
+    for (const c of children(node)) {
+      const cw = build(c);
+      if (cw) el.appendChild(cw);
+    }
+    return el;
+  }
+  if (t === 'dialog' || t === 'sdi') {
+    const el = document.createElement('div');
+    el.className = 'yaui-dialog';
+    if (node.title) {
+      document.title = String(node.title);
+      const tt = document.createElement('div');
+      tt.className = 'yaui-title';
+      tt.textContent = String(node.title);
+      el.appendChild(tt);
+    }
+    const inner = document.createElement('div');
+    inner.className = 'yaui-vbox';
+    for (const c of children(node)) {
+      const cw = build(c);
+      if (cw) inner.appendChild(cw);
+    }
+    el.appendChild(inner);
+    return el;
+  }
+  const el = document.createElement('div');
+  el.className = 'yaui-unknown';
+  el.textContent = '<unknown widget: ' + JSON.stringify(t) + '>';
+  return el;
+}
+
+function render(ui) {
+  $root.innerHTML = '';
+  const node = build(ui);
+  if (node) $root.appendChild(node);
+}
+
+const evt = new EventSource('/events');
+evt.onopen = () => { $status.textContent = 'connected'; };
+evt.onerror = () => { $status.textContent = 'disconnected'; };
+evt.addEventListener('ui', (e) => {
+  try { render(JSON.parse(e.data)); } catch (err) { console.error(err); }
+});
+evt.addEventListener('end', () => {
+  $status.textContent = 'script exited';
+  evt.close();
+});
+
+window.addEventListener('beforeunload', () => {
+  navigator.sendBeacon('/event', new Blob([JSON.stringify({type: 'close'})], {type: 'application/json'}));
+});
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# HTTP request handler
+# ---------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    # Filled in by the server creator.
+    hub: Hub = None        # type: ignore
+    script: Script = None  # type: ignore
+    debug: bool = False
+
+    def log_message(self, fmt, *args):
+        if self.debug:
+            sys.stderr.write('[yaui-web] ' + (fmt % args) + '\n')
+
+    # ----- routing -----
+    def do_GET(self):
+        if self.path == '/' or self.path == '/index.html':
+            self._send_html()
+        elif self.path == '/events':
+            self._send_events()
+        elif self.path == '/healthz':
+            self._send_text('ok')
+        else:
+            self.send_error(404, 'not found')
+
+    def do_POST(self):
+        if self.path == '/event':
+            self._handle_event()
+        else:
+            self.send_error(404, 'not found')
+
+    # ----- handlers -----
+    def _send_html(self):
+        body = INDEX_HTML.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text, status=200):
+        body = text.encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_events(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.end_headers()
+
+        q = self.hub.subscribe()
+        # Tell the client we're up.
+        try:
+            self.wfile.write(b': hello\n\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            self.hub.unsubscribe(q)
+            return
+
+        try:
+            while True:
+                try:
+                    item = q.get(timeout=15)
+                except queue.Empty:
+                    # Heartbeat to keep the connection alive through proxies.
+                    try:
+                        self.wfile.write(b': keep-alive\n\n')
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    continue
+                if item is Hub.SENTINEL_EOF:
+                    try:
+                        self.wfile.write(b'event: end\ndata: {}\n\n')
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+                payload = json.dumps(item, ensure_ascii=False)
+                try:
+                    self.wfile.write(b'event: ui\n')
+                    self.wfile.write(b'data: ' + payload.encode('utf-8') + b'\n\n')
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+        finally:
+            self.hub.unsubscribe(q)
+
+    def _handle_event(self):
+        length = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(length) if length > 0 else b''
+        if not body:
+            self.send_error(400, 'empty body')
+            return
+        try:
+            evt = json.loads(body.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            self.send_error(400, f'invalid json: {e}')
+            return
+        if not isinstance(evt, dict):
+            self.send_error(400, 'event must be a JSON object')
+            return
+        self.script.send(evt)
+        self.send_response(204)
+        self.end_headers()
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+def find_port(preferred=0):
+    s = socket.socket()
+    try:
+        s.bind(('127.0.0.1', preferred))
+    except OSError:
+        s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def make_handler_class(hub, script, debug):
+    cls = type('BoundHandler', (Handler,), {
+        'hub': hub, 'script': script, 'debug': debug,
+    })
+    return cls
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='yaui-web',
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument('--debug', action='store_true',
+                        help='log HTTP requests and the script\'s stderr')
+    parser.add_argument('--port', type=int, default=0,
+                        help='HTTP port (default: pick a free one)')
+    parser.add_argument('--no-browser', action='store_true',
+                        help='do not auto-open the browser; just print the URL')
+    parser.add_argument('script', help='path to the shell script (or any executable)')
+    parser.add_argument('args', nargs=argparse.REMAINDER,
+                        help='arguments passed to the script')
+    ns = parser.parse_args()
+
+    script_path = ns.script
+    if os.path.exists(script_path) and os.sep not in script_path:
+        script_path = os.path.abspath(script_path)
+    argv = [script_path] + (ns.args or [])
+    if not os.access(script_path, os.X_OK):
+        argv = ['/bin/sh', script_path] + (ns.args or [])
+
+    script = Script(argv)
+    hub = Hub()
+
+    # Reader thread: parse stdout, broadcast.
+    def reader():
+        try:
+            for obj in stream_json_objects(script.proc.stdout):
+                hub.publish(obj)
+        finally:
+            hub.shutdown()
+    threading.Thread(target=reader, daemon=True).start()
+
+    port = find_port(ns.port)
+    HandlerCls = make_handler_class(hub, script, ns.debug)
+    server = ThreadingHTTPServer(('127.0.0.1', port), HandlerCls)
+    server.daemon_threads = True
+
+    url = f'http://127.0.0.1:{port}/'
+    print(f'yaui-web listening on {url}', file=sys.stderr)
+
+    serve_t = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_t.start()
+
+    if not ns.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    # Wait for the script to finish (or Ctrl+C).
+    try:
+        rc = script.proc.wait()
+    except KeyboardInterrupt:
+        rc = 130
+        script.send({'type': 'close'})
+        script.close_stdin()
+        try:
+            rc = script.proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            script.terminate()
+
+    # Allow EOF event to flush to clients.
+    hub.shutdown()
+    time.sleep(0.2)
+    server.shutdown()
+
+    if ns.debug and script.stderr_lines:
+        sys.stderr.write('--- script stderr ---\n')
+        for line in script.stderr_lines:
+            sys.stderr.write(line + '\n')
+
+    return rc or 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

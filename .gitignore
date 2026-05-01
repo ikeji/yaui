@@ -6,3 +6,6 @@ _gtk_fixture.sh
 _gtk_events.log
 _gtk_shot.png
 _shot_*.png
+_web_fixture.sh
+_web_events.log
+_web_*.png
