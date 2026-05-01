@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""yaui-tui - TUI runtime for the yaui shell-script UI toolkit.
+
+Usage: yaui-tui [--debug] SCRIPT [args...]
+
+Spawns SCRIPT as a subprocess. JSON written to its stdout describes the UI;
+this program renders it with curses. Keypresses are turned into JSON events
+and written one-per-line to the script's stdin.
+
+Protocol
+--------
+- The script writes JSON objects to stdout. Each top-level object is a UI
+  tree; whitespace and partial buffering are tolerated. Objects can span
+  multiple lines.
+- The runtime writes JSON event objects (one per line) to the script's
+  stdin in response to user actions. Events:
+    {"type":"click", "id":"<widget-id>"}
+    {"type":"change","id":"<widget-id>","value":<new-value>}
+    {"type":"submit","id":"<widget-id>","value":<text>}
+    {"type":"select","id":"<widget-id>","value":<index>,"item":<item>}
+    {"type":"close"}                 # user dismissed the dialog
+"""
+
+import argparse
+import curses
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+
+
+# ---------------------------------------------------------------------------
+# JSON stream parser
+# ---------------------------------------------------------------------------
+
+def stream_json_objects(fileobj):
+    """Yield successive JSON values from a text stream by tracking depth."""
+    buf = []
+    depth = 0
+    in_string = False
+    escape = False
+    started = False
+    while True:
+        ch = fileobj.read(1)
+        if ch == '' or ch is None:
+            return
+        if not started:
+            if ch in (' ', '\t', '\n', '\r'):
+                continue
+            if ch not in ('{', '['):
+                # Skip stray characters outside JSON objects (e.g. echoed
+                # event text). We resync on the next opening brace.
+                continue
+            started = True
+            buf = [ch]
+            depth = 1
+            in_string = False
+            escape = False
+            continue
+        buf.append(ch)
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in '{[':
+            depth += 1
+        elif ch in '}]':
+            depth -= 1
+            if depth == 0:
+                text = ''.join(buf)
+                try:
+                    yield json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+                buf = []
+                started = False
+
+
+# ---------------------------------------------------------------------------
+# Subprocess wrapper
+# ---------------------------------------------------------------------------
+
+class Script:
+    def __init__(self, argv):
+        env = dict(os.environ)
+        env['YAUI'] = 'tui'
+        self.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self.q = queue.Queue()
+        self.stderr_lines = []
+        self._t_out = threading.Thread(target=self._read_stdout, daemon=True)
+        self._t_err = threading.Thread(target=self._read_stderr, daemon=True)
+        self._t_out.start()
+        self._t_err.start()
+
+    def _read_stdout(self):
+        try:
+            for obj in stream_json_objects(self.proc.stdout):
+                self.q.put(('ui', obj))
+        finally:
+            self.q.put(('eof', None))
+
+    def _read_stderr(self):
+        try:
+            for line in self.proc.stderr:
+                self.stderr_lines.append(line.rstrip('\n'))
+        except Exception:
+            pass
+
+    def send(self, event):
+        try:
+            self.proc.stdin.write(json.dumps(event, ensure_ascii=False) + '\n')
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def close_stdin(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def terminate(self, timeout=0.5):
+        if self.alive():
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Widget framework
+# ---------------------------------------------------------------------------
+
+class StateStore:
+    """Persists per-widget mutable state across re-renders, keyed by id."""
+    def __init__(self):
+        self.by_id = {}
+
+    def get(self, wid):
+        if wid is None:
+            return {}
+        return self.by_id.setdefault(wid, {})
+
+
+class Widget:
+    def __init__(self, node, state):
+        self.node = node
+        self.state = state
+        self.id = node.get('id')
+
+    def measure(self):
+        return (0, 1)
+
+    def render(self, win, x, y, w, h, focused):
+        pass
+
+    def focusable(self):
+        return False
+
+    def collect_focusables(self, out):
+        if self.focusable():
+            out.append(self)
+
+    def handle_key(self, ch):
+        return None
+
+
+def safe_addnstr(win, y, x, s, n, attr=0):
+    if n <= 0:
+        return
+    try:
+        win.addnstr(y, x, s, n, attr)
+    except curses.error:
+        pass
+
+
+class LabelWidget(Widget):
+    def measure(self):
+        text = str(self.node.get('text', ''))
+        lines = text.splitlines() or ['']
+        w = max((len(l) for l in lines), default=0)
+        return (w, len(lines))
+
+    def render(self, win, x, y, w, h, focused):
+        text = str(self.node.get('text', ''))
+        lines = text.splitlines() or ['']
+        attr = 0
+        if self.node.get('bold'):
+            attr |= curses.A_BOLD
+        for i, line in enumerate(lines[:h]):
+            safe_addnstr(win, y + i, x, line, w, attr)
+
+
+class ButtonWidget(Widget):
+    def measure(self):
+        text = str(self.node.get('text', ''))
+        return (len(text) + 4, 1)
+
+    def render(self, win, x, y, w, h, focused):
+        text = str(self.node.get('text', ''))
+        label = '[ ' + text + ' ]'
+        attr = curses.A_REVERSE if focused is self else curses.A_BOLD
+        safe_addnstr(win, y, x, label, w, attr)
+
+    def focusable(self):
+        return True
+
+    def handle_key(self, ch):
+        if ch in (10, 13, curses.KEY_ENTER, ord(' ')):
+            evt = {'type': 'click'}
+            if self.id:
+                evt['id'] = self.id
+            return evt
+        return None
+
+
+class CheckboxWidget(Widget):
+    def __init__(self, node, state):
+        super().__init__(node, state)
+        if 'checked' not in self.state:
+            self.state['checked'] = bool(node.get('checked', False))
+        elif 'checked' in node and node.get('controlled'):
+            self.state['checked'] = bool(node['checked'])
+
+    def measure(self):
+        text = str(self.node.get('text', ''))
+        return (len(text) + 4, 1)
+
+    def render(self, win, x, y, w, h, focused):
+        text = str(self.node.get('text', ''))
+        mark = 'x' if self.state['checked'] else ' '
+        s = f'[{mark}] {text}'
+        attr = curses.A_REVERSE if focused is self else 0
+        safe_addnstr(win, y, x, s, w, attr)
+
+    def focusable(self):
+        return True
+
+    def handle_key(self, ch):
+        if ch in (ord(' '), 10, 13, curses.KEY_ENTER):
+            self.state['checked'] = not self.state['checked']
+            evt = {'type': 'change', 'value': self.state['checked']}
+            if self.id:
+                evt['id'] = self.id
+            return evt
+        return None
+
+
+class TextboxWidget(Widget):
+    def __init__(self, node, state):
+        super().__init__(node, state)
+        if 'text' not in self.state:
+            self.state['text'] = str(node.get('value', ''))
+            self.state['cursor'] = len(self.state['text'])
+        elif 'value' in node and node.get('controlled'):
+            self.state['text'] = str(node['value'])
+            self.state['cursor'] = len(self.state['text'])
+
+    def measure(self):
+        w = int(self.node.get('width', 20))
+        return (w + 2, 1)
+
+    def render(self, win, x, y, w, h, focused):
+        text = self.state['text']
+        cur = self.state['cursor']
+        inner = max(0, w - 2)
+        offset = max(0, cur - inner + 1)
+        view = text[offset:offset + inner]
+        view = view.ljust(inner)
+        attr = curses.A_REVERSE if focused is self else curses.A_UNDERLINE
+        safe_addnstr(win, y, x, '[' + view + ']', w, attr)
+
+    def focusable(self):
+        return True
+
+    def handle_key(self, ch):
+        text = self.state['text']
+        cur = self.state['cursor']
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            if cur > 0:
+                self.state['text'] = text[:cur - 1] + text[cur:]
+                self.state['cursor'] = cur - 1
+                evt = {'type': 'change', 'value': self.state['text']}
+                if self.id:
+                    evt['id'] = self.id
+                return evt
+        elif ch == curses.KEY_DC:
+            if cur < len(text):
+                self.state['text'] = text[:cur] + text[cur + 1:]
+                evt = {'type': 'change', 'value': self.state['text']}
+                if self.id:
+                    evt['id'] = self.id
+                return evt
+        elif ch == curses.KEY_LEFT:
+            self.state['cursor'] = max(0, cur - 1)
+        elif ch == curses.KEY_RIGHT:
+            self.state['cursor'] = min(len(text), cur + 1)
+        elif ch == curses.KEY_HOME:
+            self.state['cursor'] = 0
+        elif ch == curses.KEY_END:
+            self.state['cursor'] = len(text)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            evt = {'type': 'submit', 'value': self.state['text']}
+            if self.id:
+                evt['id'] = self.id
+            return evt
+        elif 32 <= ch < 127:
+            self.state['text'] = text[:cur] + chr(ch) + text[cur:]
+            self.state['cursor'] = cur + 1
+            evt = {'type': 'change', 'value': self.state['text']}
+            if self.id:
+                evt['id'] = self.id
+            return evt
+        return None
+
+
+class TextareaWidget(Widget):
+    def __init__(self, node, state):
+        super().__init__(node, state)
+        if 'lines' not in self.state:
+            self.state['lines'] = str(node.get('value', '')).splitlines() or ['']
+            self.state['row'] = 0
+            self.state['col'] = 0
+        elif 'value' in node and node.get('controlled'):
+            self.state['lines'] = str(node['value']).splitlines() or ['']
+            self.state['row'] = 0
+            self.state['col'] = 0
+
+    def measure(self):
+        w = int(self.node.get('width', 30))
+        h = int(self.node.get('height', 5))
+        return (w + 2, h + 2)
+
+    def render(self, win, x, y, w, h, focused):
+        attr = curses.A_REVERSE if focused is self else 0
+        # Border
+        try:
+            for i in range(w):
+                win.addch(y, x + i, curses.ACS_HLINE)
+                win.addch(y + h - 1, x + i, curses.ACS_HLINE)
+            for i in range(h):
+                win.addch(y + i, x, curses.ACS_VLINE)
+                win.addch(y + i, x + w - 1, curses.ACS_VLINE)
+            win.addch(y, x, curses.ACS_ULCORNER)
+            win.addch(y, x + w - 1, curses.ACS_URCORNER)
+            win.addch(y + h - 1, x, curses.ACS_LLCORNER)
+            win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
+        except curses.error:
+            pass
+        inner_w = max(0, w - 2)
+        inner_h = max(0, h - 2)
+        lines = self.state['lines']
+        row = self.state['row']
+        top = max(0, row - inner_h + 1)
+        for i in range(inner_h):
+            li = top + i
+            if li >= len(lines):
+                break
+            safe_addnstr(win, y + 1 + i, x + 1, lines[li], inner_w, attr)
+
+    def focusable(self):
+        return True
+
+    def _value(self):
+        return '\n'.join(self.state['lines'])
+
+    def _emit_change(self):
+        evt = {'type': 'change', 'value': self._value()}
+        if self.id:
+            evt['id'] = self.id
+        return evt
+
+    def handle_key(self, ch):
+        lines = self.state['lines']
+        row = self.state['row']
+        col = self.state['col']
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            if col > 0:
+                lines[row] = lines[row][:col - 1] + lines[row][col:]
+                self.state['col'] = col - 1
+                return self._emit_change()
+            elif row > 0:
+                prev = lines[row - 1]
+                merged = prev + lines[row]
+                self.state['col'] = len(prev)
+                lines[row - 1] = merged
+                lines.pop(row)
+                self.state['row'] = row - 1
+                return self._emit_change()
+        elif ch in (10, 13, curses.KEY_ENTER):
+            tail = lines[row][col:]
+            lines[row] = lines[row][:col]
+            lines.insert(row + 1, tail)
+            self.state['row'] = row + 1
+            self.state['col'] = 0
+            return self._emit_change()
+        elif ch == curses.KEY_LEFT:
+            if col > 0:
+                self.state['col'] = col - 1
+            elif row > 0:
+                self.state['row'] = row - 1
+                self.state['col'] = len(lines[row - 1])
+        elif ch == curses.KEY_RIGHT:
+            if col < len(lines[row]):
+                self.state['col'] = col + 1
+            elif row < len(lines) - 1:
+                self.state['row'] = row + 1
+                self.state['col'] = 0
+        elif ch == curses.KEY_UP:
+            if row > 0:
+                self.state['row'] = row - 1
+                self.state['col'] = min(col, len(lines[row - 1]))
+        elif ch == curses.KEY_DOWN:
+            if row < len(lines) - 1:
+                self.state['row'] = row + 1
+                self.state['col'] = min(col, len(lines[row + 1]))
+        elif 32 <= ch < 127:
+            lines[row] = lines[row][:col] + chr(ch) + lines[row][col:]
+            self.state['col'] = col + 1
+            return self._emit_change()
+        return None
+
+
+class ProgressBarWidget(Widget):
+    def measure(self):
+        w = int(self.node.get('width', 30))
+        return (w, 1)
+
+    def render(self, win, x, y, w, h, focused):
+        try:
+            value = float(self.node.get('value', 0))
+            maximum = float(self.node.get('max', 100))
+        except (TypeError, ValueError):
+            value, maximum = 0.0, 100.0
+        ratio = max(0.0, min(1.0, value / maximum if maximum else 0))
+        inner = max(0, w - 2)
+        filled = int(round(inner * ratio))
+        bar = '#' * filled + '-' * (inner - filled)
+        safe_addnstr(win, y, x, '[' + bar + ']', w)
+
+
+class ListWidget(Widget):
+    def __init__(self, node, state):
+        super().__init__(node, state)
+        if 'index' not in self.state:
+            self.state['index'] = int(node.get('selected', 0) or 0)
+        elif 'selected' in node and node.get('controlled'):
+            self.state['index'] = int(node['selected'])
+
+    def _items(self):
+        return list(self.node.get('items', []) or [])
+
+    def measure(self):
+        items = self._items()
+        w = int(self.node.get('width', 0)) or max(
+            (len(self._item_text(it)) for it in items), default=10
+        )
+        h = int(self.node.get('height', 0)) or max(1, min(len(items), 8))
+        return (w + 2, h + 2)
+
+    def _item_text(self, item):
+        if isinstance(item, dict):
+            return str(item.get('text', item.get('label', item.get('value', ''))))
+        return str(item)
+
+    def render(self, win, x, y, w, h, focused):
+        try:
+            for i in range(w):
+                win.addch(y, x + i, curses.ACS_HLINE)
+                win.addch(y + h - 1, x + i, curses.ACS_HLINE)
+            for i in range(h):
+                win.addch(y + i, x, curses.ACS_VLINE)
+                win.addch(y + i, x + w - 1, curses.ACS_VLINE)
+            win.addch(y, x, curses.ACS_ULCORNER)
+            win.addch(y, x + w - 1, curses.ACS_URCORNER)
+            win.addch(y + h - 1, x, curses.ACS_LLCORNER)
+            win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
+        except curses.error:
+            pass
+        items = self._items()
+        idx = max(0, min(self.state['index'], len(items) - 1)) if items else 0
+        inner_w = max(0, w - 2)
+        inner_h = max(0, h - 2)
+        top = max(0, idx - inner_h + 1)
+        for i in range(inner_h):
+            li = top + i
+            if li >= len(items):
+                break
+            text = self._item_text(items[li])
+            attr = 0
+            if li == idx:
+                attr = curses.A_REVERSE if focused is self else curses.A_BOLD
+            safe_addnstr(win, y + 1 + i, x + 1, text, inner_w, attr)
+
+    def focusable(self):
+        return True
+
+    def handle_key(self, ch):
+        items = self._items()
+        if not items:
+            return None
+        idx = self.state['index']
+        if ch == curses.KEY_UP:
+            self.state['index'] = max(0, idx - 1)
+        elif ch == curses.KEY_DOWN:
+            self.state['index'] = min(len(items) - 1, idx + 1)
+        elif ch == curses.KEY_HOME:
+            self.state['index'] = 0
+        elif ch == curses.KEY_END:
+            self.state['index'] = len(items) - 1
+        elif ch in (10, 13, curses.KEY_ENTER):
+            evt = {'type': 'select', 'value': idx, 'item': items[idx]}
+            if self.id:
+                evt['id'] = self.id
+            return evt
+        return None
+
+
+class VBoxWidget(Widget):
+    def __init__(self, node, state, children):
+        super().__init__(node, state)
+        self.children = children
+
+    def measure(self):
+        widths = [c.measure()[0] for c in self.children]
+        heights = [c.measure()[1] for c in self.children]
+        return (max(widths, default=0), sum(heights))
+
+    def render(self, win, x, y, w, h, focused):
+        cy = y
+        for c in self.children:
+            cw, ch_ = c.measure()
+            avail = h - (cy - y)
+            if avail <= 0:
+                break
+            ch_ = min(ch_, avail)
+            cw = min(cw, w)
+            c.render(win, x, cy, cw, ch_, focused)
+            cy += ch_
+
+    def collect_focusables(self, out):
+        for c in self.children:
+            c.collect_focusables(out)
+
+
+class HBoxWidget(Widget):
+    def __init__(self, node, state, children):
+        super().__init__(node, state)
+        self.children = children
+
+    def measure(self):
+        widths = [c.measure()[0] for c in self.children]
+        heights = [c.measure()[1] for c in self.children]
+        gap = max(0, len(self.children) - 1)
+        return (sum(widths) + gap, max(heights, default=0))
+
+    def render(self, win, x, y, w, h, focused):
+        cx = x
+        for c in self.children:
+            cw, ch_ = c.measure()
+            avail = w - (cx - x)
+            if avail <= 0:
+                break
+            cw = min(cw, avail)
+            ch_ = min(ch_, h)
+            c.render(win, cx, y, cw, ch_, focused)
+            cx += cw + 1
+
+    def collect_focusables(self, out):
+        for c in self.children:
+            c.collect_focusables(out)
+
+
+class DialogWidget(Widget):
+    def __init__(self, node, state, inner):
+        super().__init__(node, state)
+        self.inner = inner
+
+    def measure(self):
+        if self.inner is None:
+            return (12, 3)
+        iw, ih = self.inner.measure()
+        return (iw + 4, ih + 4)
+
+    def render(self, win, x, y, w, h, focused):
+        try:
+            for i in range(w):
+                win.addch(y, x + i, curses.ACS_HLINE)
+                win.addch(y + h - 1, x + i, curses.ACS_HLINE)
+            for i in range(h):
+                win.addch(y + i, x, curses.ACS_VLINE)
+                win.addch(y + i, x + w - 1, curses.ACS_VLINE)
+            win.addch(y, x, curses.ACS_ULCORNER)
+            win.addch(y, x + w - 1, curses.ACS_URCORNER)
+            win.addch(y + h - 1, x, curses.ACS_LLCORNER)
+            win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
+        except curses.error:
+            pass
+        title = self.node.get('title')
+        if title:
+            ts = ' ' + str(title) + ' '
+            safe_addnstr(win, y, x + 2, ts, max(0, w - 4), curses.A_BOLD)
+        if self.inner:
+            self.inner.render(win, x + 2, y + 2, w - 4, h - 4, focused)
+
+    def collect_focusables(self, out):
+        if self.inner:
+            self.inner.collect_focusables(out)
+
+
+# ---------------------------------------------------------------------------
+# Build tree
+# ---------------------------------------------------------------------------
+
+def _children(node):
+    """Return the children list for a container node, accepting `children` or `content`."""
+    c = node.get('children')
+    if c is None:
+        c = node.get('content')
+    if c is None:
+        return []
+    if isinstance(c, list):
+        return c
+    return [c]
+
+
+def build(node, store):
+    if not isinstance(node, dict):
+        return None
+    t = node.get('type')
+    state = store.get(node.get('id'))
+    if t == 'label':
+        return LabelWidget(node, state)
+    if t == 'button':
+        return ButtonWidget(node, state)
+    if t == 'checkbox':
+        return CheckboxWidget(node, state)
+    if t == 'textbox':
+        return TextboxWidget(node, state)
+    if t == 'textarea':
+        return TextareaWidget(node, state)
+    if t == 'progressbar':
+        return ProgressBarWidget(node, state)
+    if t == 'list':
+        return ListWidget(node, state)
+    if t in ('vbox', 'wbox'):
+        kids = [build(c, store) for c in _children(node)]
+        return VBoxWidget(node, state, [k for k in kids if k is not None])
+    if t == 'hbox':
+        kids = [build(c, store) for c in _children(node)]
+        return HBoxWidget(node, state, [k for k in kids if k is not None])
+    if t in ('dialog', 'sdi'):
+        contents = _children(node)
+        if len(contents) == 1:
+            inner = build(contents[0], store)
+        elif len(contents) == 0:
+            inner = None
+        else:
+            inner = VBoxWidget(
+                {'type': 'vbox'}, {},
+                [build(c, store) for c in contents if c is not None],
+            )
+        return DialogWidget(node, state, inner)
+    return LabelWidget({'text': f'<unknown widget: {t!r}>'}, state)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run_ui(stdscr, script):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    store = StateStore()
+    root = None
+    focusables = []
+    focus_idx = 0
+    closing = False
+
+    def rebuild(node):
+        nonlocal root, focusables, focus_idx
+        prev_id = None
+        if focusables and 0 <= focus_idx < len(focusables):
+            prev_id = focusables[focus_idx].id
+        root = build(node, store)
+        new_focusables = []
+        if root is not None:
+            root.collect_focusables(new_focusables)
+        focusables = new_focusables
+        focus_idx = 0
+        if prev_id is not None:
+            for i, w in enumerate(focusables):
+                if w.id == prev_id:
+                    focus_idx = i
+                    break
+
+    while True:
+        # Drain UI updates
+        drained = False
+        while True:
+            try:
+                kind, payload = script.q.get_nowait()
+            except queue.Empty:
+                break
+            drained = True
+            if kind == 'ui' and not closing:
+                rebuild(payload)
+            elif kind == 'eof':
+                pass
+
+        # Render
+        stdscr.erase()
+        H, W = stdscr.getmaxyx()
+        if root is not None:
+            rw, rh = root.measure()
+            rw = min(rw, W)
+            rh = min(rh, max(1, H - 1))
+            rx = max(0, (W - rw) // 2)
+            ry = max(0, (H - 1 - rh) // 2)
+            focused = focusables[focus_idx] if focusables and 0 <= focus_idx < len(focusables) else None
+            root.render(stdscr, rx, ry, rw, rh, focused)
+        else:
+            safe_addnstr(stdscr, 0, 0, 'yaui-tui: waiting for UI...', W)
+        status = '[Tab] next  [S-Tab] prev  [Enter/Space] activate  [Esc] close'
+        safe_addnstr(stdscr, H - 1, 0, status, W, curses.A_DIM)
+        stdscr.refresh()
+
+        # Termination conditions
+        if closing and not script.alive():
+            break
+        if not script.alive() and script.q.empty():
+            # Show one final frame for ~200ms so users see what was last drawn
+            time.sleep(0.2)
+            break
+
+        stdscr.timeout(50)
+        try:
+            ch = stdscr.getch()
+        except KeyboardInterrupt:
+            script.send({'type': 'close'})
+            break
+        if ch == -1:
+            continue
+
+        if ch == 27:  # Esc
+            script.send({'type': 'close'})
+            script.close_stdin()
+            closing = True
+            continue
+        if ch == 9:  # Tab
+            if focusables:
+                focus_idx = (focus_idx + 1) % len(focusables)
+            continue
+        if ch == curses.KEY_BTAB:
+            if focusables:
+                focus_idx = (focus_idx - 1) % len(focusables)
+            continue
+        if ch == curses.KEY_RESIZE:
+            continue
+
+        if focusables and 0 <= focus_idx < len(focusables):
+            evt = focusables[focus_idx].handle_key(ch)
+            if evt is not None:
+                script.send(evt)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(prog='yaui-tui', description=__doc__.splitlines()[0])
+    parser.add_argument('--debug', action='store_true', help='print stderr from the script after exit')
+    parser.add_argument('script', help='path to the shell script (or any executable)')
+    parser.add_argument('args', nargs=argparse.REMAINDER, help='arguments passed to the script')
+    ns = parser.parse_args()
+
+    script_path = ns.script
+    if os.path.exists(script_path) and os.sep not in script_path:
+        # Relative bare filename in cwd: subprocess won't find it via PATH,
+        # so normalize to an absolute path.
+        script_path = os.path.abspath(script_path)
+    argv = [script_path] + (ns.args or [])
+    if not os.access(script_path, os.X_OK):
+        # Allow non-executable scripts: try to invoke via /bin/sh
+        argv = ['/bin/sh', script_path] + (ns.args or [])
+
+    script = Script(argv)
+    try:
+        curses.wrapper(run_ui, script)
+    finally:
+        script.close_stdin()
+        script.terminate()
+        if ns.debug and script.stderr_lines:
+            sys.stderr.write('--- script stderr ---\n')
+            for line in script.stderr_lines:
+                sys.stderr.write(line + '\n')
+
+    return script.proc.returncode or 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
