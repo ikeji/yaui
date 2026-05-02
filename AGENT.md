@@ -16,7 +16,12 @@
    (curses) (GTK 3)  (HTTP/SSE)
 ```
 
-3 つのランタイムは共通プロトコルを実装する独立した実行ファイル。プロトコル仕様は [`PROTOCOL.md`](PROTOCOL.md) を参照。
+4 つのランタイムは共通プロトコルを実装する独立した実行ファイル。プロトコル仕様は [`PROTOCOL.md`](PROTOCOL.md) を参照。
+
+- `yaui-tui` … curses (Linux/macOS のターミナル)
+- `yaui-gtk` … GTK 3 (Linux 主)
+- `yaui-tk`  … Tkinter (クロスプラットフォーム、特に Windows / macOS で標準同梱なので推奨)
+- `yaui-web` … HTTP + SSE で localhost ブラウザに描画
 
 ## ファイル配置
 
@@ -24,6 +29,7 @@
 |-----------------|-------------------------------------------------------|
 | `yaui-tui`      | curses ランタイム、Python 単一ファイル                |
 | `yaui-gtk`      | GTK 3 ランタイム、PyGObject                           |
+| `yaui-tk`       | Tkinter ランタイム、Python 単一ファイル               |
 | `yaui-web`      | HTTP + SSE ランタイム + 内蔵 HTML/JS クライアント     |
 | `idea.md`       | 元の設計メモ（不変）                                  |
 | `PROTOCOL.md`   | プロトコル仕様（ユーザー向け）                        |
@@ -51,10 +57,11 @@
 
 ### 状態保持の方針の違い
 
-3 ランタイムとも、新しい UI ツリーを受信するたびに「id ベースの reconciliation」で既存ノードを再利用する。
+4 ランタイムとも、新しい UI ツリーを受信するたびに「id ベースの reconciliation」で既存ノードを再利用する。
 
 - **TUI**: ウィジェットインスタンスは毎回作り直すが、状態（`text`, `cursor`, `checked`, `index`, `lines`）は `StateStore` が `id` をキーに保持する。UI ツリーで `value` を渡しても、`controlled: true` でない限り無視される。
 - **GTK**: `App._idmap` が `id → (widget, type)` をフレームをまたいで保持。`apply_ui` の冒頭でキャッシュ済みウィジェットを全 `unparent`、新しい木の中で再 attach。Entry の `set_text` は signal を block して呼び出し、`get_position()` で位置を保存→`set_position(min(pos, len(new)))` で復元する。フレーム終了時に未参照になった id は `destroy()`。`get_focus()` で旧 focus 位置を id 単位で記録し、再描画後に `grab_focus()` で復元。
+- **Tk**: tkinter は widget の reparenting を許さないので、毎フレーム木全体を作り直す。代わりに、apply 直前に `_capture_state()` で id 単位に `(value, cursor, focused, selected)` をスナップショット → 新しい木をビルドする `_build` 内で id にヒットするキャプチャを参照し、`_restore_input_value` で「focus 中かつ JSON 値と相違 → 旧値優先」「それ以外 → JSON 優先」のルールに従って初期値を決定。Listbox の選択も同様のルールで復元。
 - **Web**: `ensure(existing, node)` が `(_yauiType, _yauiId)` で再利用判定。`reconcileChildren` は親 DOM 内のスロットを順番に更新／追加／削除（React の position-based reconciliation 風）。
 
 textbox/textarea の `value` 上書きには共通ルール:
@@ -71,6 +78,7 @@ textbox/textarea の `value` 上書きには共通ルール:
 |-------------|---------------------------------------------------------------|
 | yaui-tui    | キャプチャ（curses が同じターミナルを使うため出すと表示が崩れる） |
 | yaui-gtk    | 親プロセスから継承（リアルタイム貫通）                         |
+| yaui-tk     | 親プロセスから継承（リアルタイム貫通）                         |
 | yaui-web    | 親プロセスから継承（リアルタイム貫通）                         |
 
 ### `--debug` の意味
@@ -79,6 +87,7 @@ textbox/textarea の `value` 上書きには共通ルール:
 |-------------|-------------------------------------------------------------------|
 | yaui-tui    | 未実装（curses 画面と stdout が衝突する）                         |
 | yaui-gtk    | 受信した UI ツリーを `[yaui-gtk UI] ...` の形で stderr に出力     |
+| yaui-tk     | 受信した UI ツリーを `[yaui-tk UI] ...` の形で stderr に出力      |
 | yaui-web    | 上記 + HTTP リクエストログ                                        |
 
 ## ランタイム別の実装メモ
@@ -112,6 +121,7 @@ textbox/textarea の `value` 上書きには共通ルール:
 |-----------------|-----------------------------------------------------------------|
 | `test_e2e.py`   | yaui-tui を pty で起動し、Enter / Esc で 2 段階の UI 切替を確認 |
 | `test_gtk.py`   | Xvfb 上で yaui-gtk を起動、ウィンドウが現れて N tick 描画→exit 0 |
+| `test_tk.py`    | Xvfb 上で yaui-tk  を起動、同上                                  |
 | `test_web.py`   | yaui-web を `--no-browser` で起動、curl + urllib で 3 endpoint 検証 |
 
 合成入力ツール（xdotool / python-xlib / pyatspi）は環境にないので、GTK と Web のテストはユーザー操作の代わりに「スクリプト主導で UI を更新して自然終了する fixture」を使う。視覚確認には ImageMagick の `import` でスクリーンショット取得。
@@ -119,15 +129,16 @@ textbox/textarea の `value` 上書きには共通ルール:
 ## 新しいウィジェットの追加チェックリスト
 
 1. `yaui-tui` の `build()` と新しい `Widget` クラスを追加
-2. `yaui-gtk` の `build_widget()` に分岐を追加
-3. `yaui-web` の `INDEX_HTML` 内 `build()` 関数（JS）に分岐を追加
-4. `PROTOCOL.md` のウィジェット一覧に追加
-5. テストは可能なら `showcase.sh` に並べる
-6. すべてのランタイムでフォールバック（`<unknown widget>`）に落ちないか確認
+2. `yaui-gtk` の `_create_widget` / `_update_widget` に分岐を追加
+3. `yaui-tk` の `_build` に分岐を追加（必要なら `_capture_state` も拡張）
+4. `yaui-web` の `INDEX_HTML` 内 `create` / `update` (JS) に分岐を追加
+5. `PROTOCOL.md` のウィジェット一覧に追加
+6. テストは可能なら `showcase.sh` に並べる
+7. すべてのランタイムでフォールバック（`<unknown widget>`）に落ちないか確認
 
 ## やりがちな落とし穴
 
-- **追加し忘れ**: 1 ランタイムだけに足すと他で `<unknown widget>` が表示される。コミット前に必ず 3 つすべてに反映する
+- **追加し忘れ**: 1 ランタイムだけに足すと他で `<unknown widget>` が表示される。コミット前に必ず 4 つすべてに反映する
 - **GTK のスレッド境界**: reader スレッドから直接 GTK API を呼ぶと segfault。必ず `GLib.idle_add`
 - **Web の DOM 全再構築**: textbox/textarea の `change` で再描画するとカーソル飛び。デモはこの罠を回避する書き方をしている
 - **再エミット時の `value` 扱い**: TUI は無視、GTK/Web は適用、という非対称をユーザースクリプトに見せないため、`controlled` フラグを使うか、`change` を素直に echo back する。

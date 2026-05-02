@@ -1,6 +1,6 @@
 # yaui Protocol
 
-3 つのランタイム（`yaui-tui` / `yaui-gtk` / `yaui-web`）すべてが共通で扱う、スクリプトとの通信仕様。
+4 つのランタイム（`yaui-tui` / `yaui-gtk` / `yaui-tk` / `yaui-web`）すべてが共通で扱う、スクリプトとの通信仕様。
 
 ## 流れ
 
@@ -153,7 +153,7 @@
 ランタイムは新しい UI ツリーが届いた際、可能な限り既存のウィジェット／DOM ノードを再利用する（React の reconciliation と同じ思想）。
 
 - **TUI**: ウィジェット状態（textbox の文字列・カーソル、checkbox、list 選択、textarea）は `id` をキーに保持。新しいツリーの `value` は無視される。明示的に上書きしたい場合は `controlled: true` を付ける。
-- **GTK / Web**: `id` で widget／DOM ノードを再利用。同じ要素が再 attach されるので focus・カーソル位置は維持される。`value` の扱いは:
+- **GTK / Tk / Web**: `id` で widget／DOM ノードを再利用（Tk は再 attach できない都合から、毎回ビルドしつつ id ごとの状態をスナップショット → 復元）。`value` の扱いは:
   - 新しい値が現在値と等しい → 何もしない（カーソル温存）
   - 新しい値が異なり、その入力に focus がある → 何もしない（typeahead で打鍵中に script の echo back によって既入力が消える race を防ぐ）
   - 新しい値が異なり、focus が無い → 上書き
@@ -162,7 +162,7 @@
 
 ## 環境変数
 
-ランタイムはスクリプトの環境に `YAUI=tui|gtk|web` を設定する。スクリプトはこれを見て描画先を分岐できる。
+ランタイムはスクリプトの環境に `YAUI=tui|gtk|tk|web` を設定する。スクリプトはこれを見て描画先を分岐できる。
 
 ## ストリームの解析
 

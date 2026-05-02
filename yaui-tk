@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""yaui-tk - Tkinter runtime for the yaui shell-script UI toolkit.
+
+Usage: yaui-tk [--debug] SCRIPT [args...]
+
+Same JSON protocol as yaui-tui / yaui-gtk / yaui-web. Renders the UI with
+ttk widgets. The script's stderr is inherited from this process so its
+diagnostic output appears on the user's terminal as it happens. With
+--debug, each UI JSON tree received from the script is also dumped to
+stderr.
+
+Tkinter ships with the standard Python distribution on Windows and macOS,
+so this is the lightest-deployment desktop runtime: install Python and
+this single file is enough.
+"""
+
+import argparse
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+
+import tkinter as tk
+from tkinter import ttk
+
+
+# ---------------------------------------------------------------------------
+# JSON stream parser (shared protocol)
+# ---------------------------------------------------------------------------
+
+def stream_json_objects(fileobj):
+    buf = []
+    depth = 0
+    in_string = False
+    escape = False
+    started = False
+    while True:
+        ch = fileobj.read(1)
+        if ch == '' or ch is None:
+            return
+        if not started:
+            if ch in (' ', '\t', '\n', '\r'):
+                continue
+            if ch not in ('{', '['):
+                continue
+            started = True
+            buf = [ch]
+            depth = 1
+            in_string = False
+            escape = False
+            continue
+        buf.append(ch)
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in '{[':
+            depth += 1
+        elif ch in '}]':
+            depth -= 1
+            if depth == 0:
+                text = ''.join(buf)
+                try:
+                    yield json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+                buf = []
+                started = False
+
+
+# ---------------------------------------------------------------------------
+# Subprocess wrapper
+# ---------------------------------------------------------------------------
+
+class Script:
+    def __init__(self, argv):
+        env = dict(os.environ)
+        env['YAUI'] = 'tk'
+        # stderr inherits the parent terminal so the script's diagnostics
+        # appear in real time.
+        self.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self.q = queue.Queue()
+        self._t_out = threading.Thread(target=self._read_stdout, daemon=True)
+        self._t_out.start()
+
+    def _read_stdout(self):
+        try:
+            for obj in stream_json_objects(self.proc.stdout):
+                self.q.put(('ui', obj))
+        finally:
+            self.q.put(('eof', None))
+
+    def send(self, event):
+        try:
+            self.proc.stdin.write(json.dumps(event, ensure_ascii=False) + '\n')
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def close_stdin(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def terminate(self, timeout=0.5):
+        if self.alive():
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _children(node):
+    c = node.get('children')
+    if c is None:
+        c = node.get('content')
+    if c is None:
+        return []
+    if isinstance(c, list):
+        return c
+    return [c]
+
+
+def _emit(send, base, wid):
+    if wid is not None:
+        base = dict(base)
+        base['id'] = wid
+    send(base)
+
+
+def _item_text(item):
+    if isinstance(item, dict):
+        return str(item.get('text', item.get('label', item.get('value', ''))))
+    return str(item)
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+class App:
+    def __init__(self, script, debug=False):
+        self.script = script
+        self.debug = debug
+        self.root = tk.Tk()
+        self.root.title('yaui-tk')
+        # Don't fix geometry: let Tk auto-size to whatever the script's
+        # widgets ask for. Users can still resize.
+        self.root.minsize(200, 80)
+        self.root.bind_all('<Escape>', lambda _e: self._on_close())
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+        self._closing = False
+        self._content = None
+        self._captured = {}  # id -> dict(value, cursor, focused, selected)
+
+        self._content = ttk.Label(self.root, text='yaui-tk: waiting for UI…',
+                                  padding=12)
+        self._content.pack(fill='both', expand=True)
+        self.root.after(50, self._poll)
+
+    def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.script.send({'type': 'close'})
+        self.script.close_stdin()
+        self.root.destroy()
+
+    def _poll(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                kind, payload = self.script.q.get_nowait()
+                if kind == 'eof':
+                    self.root.after(150, self.root.destroy)
+                    return
+                if kind == 'ui':
+                    if self.debug:
+                        sys.stderr.write('[yaui-tk UI] '
+                                         + json.dumps(payload, ensure_ascii=False)
+                                         + '\n')
+                        sys.stderr.flush()
+                    self._apply(payload)
+        except queue.Empty:
+            pass
+        if not self._closing:
+            self.root.after(50, self._poll)
+
+    # ----- capture / restore -----
+
+    def _capture_state(self):
+        """Walk current widgets and snapshot input state by id."""
+        captured = {}
+        focused = self.root.focus_get()
+
+        def walk(w):
+            wid = getattr(w, '_yaui_id', None)
+            wtype = getattr(w, '_yaui_type', None)
+            if wid is not None and wtype is not None:
+                state = {'focused': False}
+                if wtype == 'textbox':
+                    try:
+                        state['value'] = w.get()
+                        state['cursor'] = w.index(tk.INSERT)
+                        state['focused'] = (focused is w)
+                    except tk.TclError:
+                        pass
+                elif wtype == 'textarea':
+                    inner = getattr(w, '_yaui_text', None)
+                    if inner is not None:
+                        try:
+                            state['value'] = inner.get('1.0', 'end-1c')
+                            state['cursor'] = inner.index(tk.INSERT)
+                            state['focused'] = (focused is inner)
+                        except tk.TclError:
+                            pass
+                elif wtype == 'list':
+                    inner = getattr(w, '_yaui_listbox', None)
+                    if inner is not None:
+                        try:
+                            sel = inner.curselection()
+                            state['selected'] = sel[0] if sel else None
+                            state['focused'] = (focused is inner)
+                        except tk.TclError:
+                            pass
+                elif wtype == 'checkbox':
+                    var = getattr(w, '_yaui_var', None)
+                    if var is not None:
+                        try:
+                            state['value'] = bool(var.get())
+                            state['focused'] = (focused is w)
+                        except tk.TclError:
+                            pass
+                if state.get('focused') or 'value' in state or 'selected' in state:
+                    captured[wid] = state
+            try:
+                for c in w.winfo_children():
+                    walk(c)
+            except tk.TclError:
+                pass
+
+        walk(self.root)
+        return captured
+
+    # ----- apply -----
+
+    def _apply(self, node):
+        captured = self._capture_state()
+
+        if self._content is not None:
+            try:
+                self._content.destroy()
+            except tk.TclError:
+                pass
+            self._content = None
+
+        # One outer container; everything else is parented inside it.
+        outer = ttk.Frame(self.root, padding=12)
+        outer.pack(fill='both', expand=True)
+        self._content = outer
+
+        ctx = {
+            'send': self.script.send,
+            'captured': captured,
+            'focus_target': None,
+        }
+
+        if isinstance(node, dict) and node.get('type') in ('dialog', 'sdi'):
+            title = node.get('title')
+            if title:
+                self.root.title(str(title))
+            contents = _children(node)
+            if not contents:
+                pass
+            elif len(contents) == 1:
+                inner = _build(contents[0], outer, ctx)
+                if inner is not None:
+                    inner.pack(fill='both', expand=True)
+            else:
+                for c in contents:
+                    cw = _build(c, outer, ctx)
+                    if cw is not None:
+                        cw.pack(side='top', anchor='w', fill='x', padx=2, pady=2)
+        else:
+            inner = _build(node, outer, ctx)
+            if inner is not None:
+                inner.pack(fill='both', expand=True)
+
+        ft = ctx.get('focus_target')
+        if ft is not None:
+            try:
+                ft.focus_set()
+            except tk.TclError:
+                pass
+        # Recompute the natural size after the widget tree is in place.
+        self.root.update_idletasks()
+        self.root.geometry('')
+
+    def run(self):
+        try:
+            self.root.mainloop()
+        finally:
+            self.script.close_stdin()
+            self.script.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Widget builder
+# ---------------------------------------------------------------------------
+
+def _restore_input_value(node, captured_state, controlled_default=False):
+    """Decide which value to use for an input at this render.
+
+    Same React-style rule as yaui-gtk / yaui-web:
+      - If `controlled: true`, always use the JSON value
+      - Otherwise, if the user had focus and what they had differs from the
+        JSON value (e.g. they typed faster than the script could echo), keep
+        the user's value
+      - Otherwise, use the JSON value (if any), else fall back to captured
+    """
+    json_value = node.get('value') if 'value' in node else None
+    captured_value = captured_state.get('value') if captured_state else None
+    controlled = bool(node.get('controlled')) or controlled_default
+    if controlled and json_value is not None:
+        return str(json_value)
+    if (captured_state and captured_state.get('focused')
+            and captured_value is not None
+            and (json_value is None or str(json_value) != str(captured_value))):
+        return str(captured_value)
+    if json_value is not None:
+        return str(json_value)
+    if captured_value is not None:
+        return str(captured_value)
+    return ''
+
+
+def _build(node, parent, ctx):
+    if not isinstance(node, dict):
+        return None
+    t = node.get('type')
+    wid = node.get('id')
+    captured = ctx['captured'].get(wid) if wid is not None else None
+
+    if t == 'label':
+        text = str(node.get('text', ''))
+        font = ('TkDefaultFont', 10, 'bold') if node.get('bold') else None
+        w = ttk.Label(parent, text=text, anchor='w', justify='left',
+                      wraplength=600)
+        if font:
+            w.configure(font=font)
+        return w
+
+    if t == 'button':
+        w = ttk.Button(parent, text=str(node.get('text', '')))
+        w.configure(command=lambda: _emit(ctx['send'], {'type': 'click'}, wid))
+        return w
+
+    if t == 'checkbox':
+        var = tk.BooleanVar()
+        val = bool(node.get('checked', False))
+        if captured is not None and 'value' in captured and not bool(node.get('controlled')):
+            val = bool(captured['value'])
+        var.set(val)
+        w = ttk.Checkbutton(parent, text=str(node.get('text', '')),
+                            variable=var)
+        def on_toggle():
+            _emit(ctx['send'], {'type': 'change', 'value': var.get()}, wid)
+        w.configure(command=on_toggle)
+        w._yaui_id = wid
+        w._yaui_type = t
+        w._yaui_var = var
+        if captured and captured.get('focused'):
+            ctx['focus_target'] = w
+        return w
+
+    if t == 'textbox':
+        var = tk.StringVar()
+        suppress = [True]
+        var.set(_restore_input_value(node, captured))
+        suppress[0] = False
+        try:
+            width = int(node.get('width', 18))
+        except (TypeError, ValueError):
+            width = 18
+        w = ttk.Entry(parent, textvariable=var, width=width)
+        w._yaui_id = wid
+        w._yaui_type = t
+        w._yaui_var = var
+        w._yaui_suppress = suppress
+        # Restore cursor + focus
+        if captured:
+            try:
+                cur = captured.get('cursor', tk.END)
+                w.icursor(cur)
+            except tk.TclError:
+                pass
+            if captured.get('focused'):
+                ctx['focus_target'] = w
+        # Trace for change events
+        def on_change(*_a):
+            if suppress[0]:
+                return
+            _emit(ctx['send'], {'type': 'change', 'value': var.get()}, wid)
+        var.trace_add('write', on_change)
+        w.bind('<Return>',
+               lambda _e: _emit(ctx['send'],
+                                {'type': 'submit', 'value': var.get()}, wid))
+        return w
+
+    if t == 'textarea':
+        wrapper = ttk.Frame(parent)
+        try:
+            cols = int(node.get('width', 30))
+            rows = int(node.get('height', 5))
+        except (TypeError, ValueError):
+            cols, rows = 30, 5
+        text = tk.Text(wrapper, wrap='word', width=cols, height=rows,
+                       undo=True)
+        scroll = ttk.Scrollbar(wrapper, orient='vertical',
+                               command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+        suppress = [True]
+        wrapper._yaui_id = wid
+        wrapper._yaui_type = t
+        wrapper._yaui_text = text
+        wrapper._yaui_suppress = suppress
+        # Set value
+        v = _restore_input_value(node, captured)
+        if v:
+            text.insert('1.0', v)
+        text.edit_modified(False)
+        suppress[0] = False
+        # Restore cursor + focus
+        if captured:
+            try:
+                cur = captured.get('cursor', '1.0')
+                text.mark_set(tk.INSERT, cur)
+            except tk.TclError:
+                pass
+            if captured.get('focused'):
+                ctx['focus_target'] = text
+        # Bind change
+        def on_modified(_e):
+            if suppress[0]:
+                text.edit_modified(False)
+                return
+            if text.edit_modified():
+                cur = text.get('1.0', 'end-1c')
+                _emit(ctx['send'], {'type': 'change', 'value': cur}, wid)
+                text.edit_modified(False)
+        text.bind('<<Modified>>', on_modified)
+        return wrapper
+
+    if t == 'progressbar':
+        try:
+            v = float(node.get('value', 0))
+            m = float(node.get('max', 100))
+        except (TypeError, ValueError):
+            v, m = 0.0, 100.0
+        w = ttk.Progressbar(parent, length=240, maximum=m, value=v,
+                            mode='determinate')
+        return w
+
+    if t == 'list':
+        wrapper = ttk.Frame(parent)
+        try:
+            h = int(node.get('height', 6))
+        except (TypeError, ValueError):
+            h = 6
+        lb = tk.Listbox(wrapper, height=h, exportselection=False,
+                        activestyle='dotbox')
+        scroll = ttk.Scrollbar(wrapper, orient='vertical', command=lb.yview)
+        lb.configure(yscrollcommand=scroll.set)
+        lb.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+        items = list(node.get('items', []) or [])
+        for it in items:
+            lb.insert(tk.END, _item_text(it))
+        suppress = [True]
+        wrapper._yaui_id = wid
+        wrapper._yaui_type = t
+        wrapper._yaui_listbox = lb
+        wrapper._yaui_items = items
+        wrapper._yaui_suppress = suppress
+        # Restore selection: prefer captured (user) over JSON unless controlled
+        sel = None
+        if captured and 'selected' in captured and captured['selected'] is not None:
+            sel = captured['selected']
+        elif 'selected' in node and node.get('selected') is not None:
+            try:
+                sel = int(node['selected'])
+            except (TypeError, ValueError):
+                sel = None
+        if sel is not None and 0 <= sel < len(items):
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(sel)
+            lb.activate(sel)
+            lb.see(sel)
+        suppress[0] = False
+        if captured and captured.get('focused'):
+            ctx['focus_target'] = lb
+
+        def on_change(_e):
+            if suppress[0]:
+                return
+            cur = lb.curselection()
+            if cur:
+                idx = cur[0]
+                _emit(ctx['send'],
+                      {'type': 'change',
+                       'value': idx,
+                       'item': wrapper._yaui_items[idx]}, wid)
+
+        def on_activate(_e):
+            cur = lb.curselection()
+            if cur:
+                idx = cur[0]
+                _emit(ctx['send'],
+                      {'type': 'select',
+                       'value': idx,
+                       'item': wrapper._yaui_items[idx]}, wid)
+
+        lb.bind('<<ListboxSelect>>', on_change)
+        lb.bind('<Double-Button-1>', on_activate)
+        lb.bind('<Return>', on_activate)
+        return wrapper
+
+    if t in ('vbox', 'wbox', 'hbox'):
+        frame = ttk.Frame(parent)
+        kids = _children(node)
+        for c in kids:
+            cw = _build(c, frame, ctx)
+            if cw is None:
+                continue
+            if t == 'hbox':
+                cw.pack(side='left', anchor='w', padx=4, pady=2)
+            else:
+                cw.pack(side='top', anchor='w', padx=2, pady=2, fill='x')
+        return frame
+
+    if t in ('dialog', 'sdi'):
+        contents = _children(node)
+        if not contents:
+            return None
+        if len(contents) == 1:
+            return _build(contents[0], parent, ctx)
+        frame = ttk.Frame(parent)
+        for c in contents:
+            cw = _build(c, frame, ctx)
+            if cw is not None:
+                cw.pack(side='top', anchor='w', fill='x', padx=2, pady=2)
+        return frame
+
+    # Unknown
+    return ttk.Label(parent, text=f'<unknown widget: {t!r}>',
+                     foreground='red')
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(prog='yaui-tk',
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument('--debug', action='store_true',
+                        help='dump each UI tree received from the script to stderr')
+    parser.add_argument('script',
+                        help='path to the shell script (or any executable)')
+    parser.add_argument('args', nargs=argparse.REMAINDER,
+                        help='arguments passed to the script')
+    ns = parser.parse_args()
+
+    script_path = ns.script
+    if os.path.exists(script_path) and os.sep not in script_path:
+        script_path = os.path.abspath(script_path)
+    argv = [script_path] + (ns.args or [])
+    if not os.access(script_path, os.X_OK):
+        argv = ['/bin/sh', script_path] + (ns.args or [])
+
+    script = Script(argv)
+    app = App(script, debug=ns.debug)
+    try:
+        app.run()
+    finally:
+        script.close_stdin()
+        script.terminate()
+
+    return script.proc.returncode or 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

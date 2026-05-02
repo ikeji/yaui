@@ -8,7 +8,8 @@
 
 ```sh
 ./yaui-tui test.sh    # ターミナル (curses)
-./yaui-gtk test.sh    # デスクトップウィンドウ (GTK 3)
+./yaui-gtk test.sh    # デスクトップウィンドウ (GTK 3, Linux 向け)
+./yaui-tk  test.sh    # デスクトップウィンドウ (Tkinter, Windows / macOS / Linux)
 ./yaui-web test.sh    # ブラウザ (http://127.0.0.1:<port>/)
 ```
 
@@ -28,6 +29,7 @@ read line   # stdin にイベントが届くまで待つ
 |----------------|------------------------------------------------------|
 | `yaui-tui`     | TUI ランタイム（Python curses、依存ゼロ）            |
 | `yaui-gtk`     | GTK 3 ランタイム（PyGObject）                        |
+| `yaui-tk`      | Tkinter ランタイム（Windows/macOS の Python に標準同梱）|
 | `yaui-web`     | ブラウザランタイム（Python `http.server` + SSE）     |
 | `test.sh`      | Hello World                                          |
 | `sample.sh`    | 入力フォーム（テキスト + チェック + OK/Cancel）      |
@@ -49,6 +51,7 @@ read line   # stdin にイベントが届くまで待つ
 
 - Python 3.10+
 - yaui-gtk: GTK 3 と PyGObject（Debian/Ubuntu なら `python3-gi` と `gir1.2-gtk-3.0`）
+- yaui-tk: Tkinter（Windows/macOS の公式 Python インストーラに標準同梱、Debian/Ubuntu なら `python3-tk`）
 - yaui-web: 標準ライブラリのみ。デフォルトでシステムブラウザを開く（`--no-browser` で抑止）
 
 ## デバッグ
@@ -60,5 +63,6 @@ read line   # stdin にイベントが届くまで待つ
 ```sh
 python3 test_e2e.py     # yaui-tui を pty で起動して操作
 python3 test_gtk.py     # yaui-gtk を Xvfb 上で起動して描画確認
+python3 test_tk.py      # yaui-tk  を Xvfb 上で起動して描画確認
 python3 test_web.py     # yaui-web の HTTP/SSE/POST を curl と urllib で検証
 ```

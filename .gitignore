@@ -9,3 +9,5 @@ _shot_*.png
 _web_fixture.sh
 _web_events.log
 _web_*.png
+_tk_fixture.sh
+_tk_*.png
