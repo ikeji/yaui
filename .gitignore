@@ -11,3 +11,5 @@ _web_events.log
 _web_*.png
 _tk_fixture.sh
 _tk_*.png
+_mh_fixture.sh
+_mh_events.log

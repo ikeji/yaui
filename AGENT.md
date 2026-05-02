@@ -109,11 +109,15 @@ textbox/textarea の `value` 上書きには共通ルール:
 
 ### yaui-web
 
-- `Hub` クラスが「最新 UI ツリー」と「購読中の SSE クライアント」のキュー群を保持
-- 新しい SSE 接続には最新ツリーを即座に送るので、ブラウザのリロードで状態が崩れない
+- `Hub` が「最新 UI ツリー (`_latest`)」と「id ごとの shadow (`_shadow`)」を保持
+- マルチヘッド：複数タブ・別ブラウザが同時購読でき、片方の入力が他方に即座に反映される
+- 新規購読者には接続時に `('ui', latest)` を送り、続けて shadow の各エントリを `('peer', entry)` で順次 replay → リロードや遅参 tab が自動的に追従
+- `relay_peer(event)` が `_handle_event` から呼ばれ、shadow を更新しつつ全 SSE 購読者へ `event: peer` を broadcast。クライアントは `applyPeer` で `[data-yaui-id="..."]` を引き、focus 中なら無視・そうでなければ DOM の値を更新
+- `_refresh_shadow_from_tree` が UI ツリー emit 時に `value`/`checked`/`selected` を shadow にミラー → スクリプト主導のリセットで shadow が腐らない
 - 終了時は `Hub.shutdown()` で全クライアントに `event: end` を送ってからプロセス終了
 - 内蔵 HTML/JS は単一の `INDEX_HTML` 文字列。別ファイルに分けない方針（単一バイナリ感を保つため）
-- ブラウザのタブを閉じると `beforeunload` で `navigator.sendBeacon('/event', {type:close})` を投げる（`fetch` の `keepalive` も使用）
+- ブラウザのタブ閉じでは close を自動送信しない（マルチヘッド前提でスクリプトはタブをまたいで生きる）。明示的な終了が必要なら UI に Quit ボタンを置くか、yaui-web プロセスを Ctrl+C
+- `keepalive: true` を `fetch('/event')` に付けてナビゲーション中でも POST 取りこぼし防止
 
 ## テスト戦略
 
@@ -123,6 +127,7 @@ textbox/textarea の `value` 上書きには共通ルール:
 | `test_gtk.py`   | Xvfb 上で yaui-gtk を起動、ウィンドウが現れて N tick 描画→exit 0 |
 | `test_tk.py`    | Xvfb 上で yaui-tk  を起動、同上                                  |
 | `test_web.py`   | yaui-web を `--no-browser` で起動、curl + urllib で 3 endpoint 検証 |
+| `test_web_multihead.py` | 2 つの SSE クライアントで peer broadcast / shadow replay を検証 |
 
 合成入力ツール（xdotool / python-xlib / pyatspi）は環境にないので、GTK と Web のテストはユーザー操作の代わりに「スクリプト主導で UI を更新して自然終了する fixture」を使う。視覚確認には ImageMagick の `import` でスクリーンショット取得。
 

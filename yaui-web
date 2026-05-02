@@ -139,23 +139,35 @@ class Script:
 class Hub:
     """Broadcasts UI updates to every connected SSE subscriber.
 
-    Late subscribers immediately receive the most recent UI tree (so that
-    refreshing the page works) and any further updates as they arrive.
+    Late subscribers (page reload, second tab) immediately receive the most
+    recent UI tree and a per-id "shadow" of input state captured from
+    other tabs since the last UI tree was emitted, so they sync up
+    without forcing the script to re-emit.
+
+    Items put on each subscriber queue are tagged tuples:
+      ('ui',   <ui-tree-dict>)     – broadcast on script UI emission
+      ('peer', <event-dict>)       – broadcast on user event from any tab
+      SENTINEL_EOF                 – server is shutting down
     """
     SENTINEL_EOF = object()
 
     def __init__(self):
         self._lock = threading.Lock()
         self._subs = []  # list[queue.Queue]
-        self._latest = None  # last UI JSON or None
+        self._latest = None    # last UI JSON or None
+        self._shadow = {}      # id -> peer-event payload {type, id, value [, item]}
 
     def subscribe(self):
         q = queue.Queue()
         with self._lock:
             self._subs.append(q)
             latest = self._latest
+            # Snapshot shadow values to replay; preserve insertion order.
+            shadow_entries = list(self._shadow.values())
         if latest is not None:
-            q.put(latest)
+            q.put(('ui', latest))
+        for entry in shadow_entries:
+            q.put(('peer', entry))
         return q
 
     def unsubscribe(self, q):
@@ -166,11 +178,60 @@ class Hub:
                 pass
 
     def publish(self, ui_json):
+        """Called when the script emits a new UI tree."""
         with self._lock:
             self._latest = ui_json
+            self._refresh_shadow_from_tree(ui_json)
             subs = list(self._subs)
         for q in subs:
-            q.put(ui_json)
+            q.put(('ui', ui_json))
+
+    def relay_peer(self, event):
+        """Called when any tab POSTs a user event; record + broadcast."""
+        with self._lock:
+            wid = event.get('id')
+            if (wid is not None
+                    and event.get('type') in ('change', 'select')):
+                # Normalise to a 'change'-shaped shadow entry.
+                rec = {'type': 'change', 'id': wid}
+                if 'value' in event:
+                    rec['value'] = event['value']
+                if 'item' in event:
+                    rec['item'] = event['item']
+                self._shadow[wid] = rec
+            subs = list(self._subs)
+        for q in subs:
+            q.put(('peer', event))
+
+    def _refresh_shadow_from_tree(self, node):
+        """Walk the UI tree; when a node carries an explicit value/checked/
+        selected, mirror it into the shadow so future subscribers (and
+        reloads) start from the script's declared state, not stale user
+        input from before this UI tree was emitted."""
+        if not isinstance(node, dict):
+            return
+        wid = node.get('id')
+        t = node.get('type')
+        if wid is not None:
+            entry = None
+            if t == 'checkbox' and 'checked' in node:
+                entry = {'type': 'change', 'id': wid,
+                         'value': bool(node['checked'])}
+            elif t in ('textbox', 'textarea') and 'value' in node:
+                entry = {'type': 'change', 'id': wid,
+                         'value': node['value']}
+            elif t == 'list' and 'selected' in node:
+                entry = {'type': 'change', 'id': wid,
+                         'value': node['selected']}
+            if entry is not None:
+                self._shadow[wid] = entry
+        for k in ('content', 'children'):
+            c = node.get(k)
+            if isinstance(c, list):
+                for child in c:
+                    self._refresh_shadow_from_tree(child)
+            elif isinstance(c, dict):
+                self._refresh_shadow_from_tree(c)
 
     def shutdown(self):
         with self._lock:
@@ -268,6 +329,12 @@ function ensure(existing, node) {
   el._yauiType = t;
   el._yauiId = node.id;
   el._yauiNode = node;
+  // Expose id as a data attribute so peer events can find this widget.
+  if (node.id !== undefined && node.id !== null) {
+    el.dataset.yauiId = String(node.id);
+  } else if ('yauiId' in el.dataset) {
+    delete el.dataset.yauiId;
+  }
   update(el, node);
   return el;
 }
@@ -458,20 +525,47 @@ function render(ui) {
   }
 }
 
+// Apply a peer event from another tab (or replayed shadow on connect)
+// to the local DOM. Uses the same focus-aware rule as the rendering
+// reconciliation: don't disturb an input the user is currently editing.
+function applyPeer(event) {
+  if (!event || event.id === undefined || event.id === null) return;
+  const wid = String(event.id);
+  const el = document.querySelector('[data-yaui-id="' + CSS.escape(wid) + '"]');
+  if (!el) return;
+  const t = el._yauiType;
+  if (t === 'textbox' || t === 'textarea') {
+    const v = String(event.value ?? '');
+    if (el.value !== v && document.activeElement !== el) el.value = v;
+  } else if (t === 'checkbox') {
+    const cb = el._yauiCb;
+    if (cb && cb.checked !== !!event.value) cb.checked = !!event.value;
+  } else if (t === 'list') {
+    const idx = Number(event.value);
+    for (let i = 0; i < el.children.length; i++) {
+      el.children[i].classList.toggle('selected', i === idx);
+    }
+  }
+}
+
 const evt = new EventSource('/events');
 evt.onopen = () => { $status.textContent = 'connected'; };
 evt.onerror = () => { $status.textContent = 'disconnected'; };
 evt.addEventListener('ui', (e) => {
   try { render(JSON.parse(e.data)); } catch (err) { console.error(err); }
 });
+evt.addEventListener('peer', (e) => {
+  try { applyPeer(JSON.parse(e.data)); } catch (err) { console.error(err); }
+});
 evt.addEventListener('end', () => {
   $status.textContent = 'script exited';
   evt.close();
 });
 
-window.addEventListener('beforeunload', () => {
-  navigator.sendBeacon('/event', new Blob([JSON.stringify({type: 'close'})], {type: 'application/json'}));
-});
+// Note: tab close / reload no longer auto-emits {type:"close"} — the
+// runtime is multi-head, so the script outlives any single tab. Scripts
+// that want a "Quit" affordance should expose a button. Press Ctrl+C
+// against the yaui-web process to exit.
 </script>
 </body>
 </html>
@@ -563,10 +657,12 @@ class Handler(BaseHTTPRequestHandler):
                     except (BrokenPipeError, ConnectionResetError):
                         pass
                     return
-                payload = json.dumps(item, ensure_ascii=False)
+                # item is (kind, payload) where kind in {'ui','peer'}.
+                kind, payload = item
+                data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
                 try:
-                    self.wfile.write(b'event: ui\n')
-                    self.wfile.write(b'data: ' + payload.encode('utf-8') + b'\n\n')
+                    self.wfile.write(b'event: ' + kind.encode() + b'\n')
+                    self.wfile.write(b'data: ' + data + b'\n\n')
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     return
@@ -588,6 +684,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, 'event must be a JSON object')
             return
         self.script.send(evt)
+        # Mirror the event to every other tab so they stay in sync without
+        # waiting for the script to re-emit a full UI tree.
+        self.hub.relay_peer(evt)
         self.send_response(204)
         self.end_headers()
 
