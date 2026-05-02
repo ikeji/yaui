@@ -507,13 +507,19 @@ class App:
             return False
 
         # Capture which cached widget currently has focus, so we can
-        # restore it after the rebuild.
+        # restore it after the rebuild. Also remember the cursor position
+        # for Entry widgets — `grab_focus()` later in this method would
+        # otherwise trigger Entry's default select-all-on-focus behaviour
+        # and move the caret to the end.
         focus_id = None
+        focus_cursor = None
         focused = self.window.get_focus()
         if focused is not None:
             for k, (cw, _) in self._idmap.items():
                 if cw is focused or focused.is_ancestor(cw):
                     focus_id = k
+                    if isinstance(cw, Gtk.Entry):
+                        focus_cursor = cw.get_position()
                     break
 
         # Detach every cached widget from its current parent so build_widget
@@ -564,6 +570,12 @@ class App:
             cw, _ = self._idmap[focus_id]
             target = getattr(cw, '_yaui_lb', None) or getattr(cw, '_yaui_tv', None) or cw
             target.grab_focus()
+            # GtkEntry's default focus behaviour selects all the text and
+            # parks the caret at the end. Restore the saved cursor position
+            # and collapse the selection.
+            if isinstance(target, Gtk.Entry):
+                pos = focus_cursor if focus_cursor is not None else target.get_position()
+                target.select_region(pos, pos)
         return False  # for GLib.idle_add (don't repeat)
 
     def consume(self):
