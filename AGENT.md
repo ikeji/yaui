@@ -60,7 +60,7 @@
 4 ランタイムとも、新しい UI ツリーを受信するたびに「id ベースの reconciliation」で既存ノードを再利用する。
 
 - **TUI**: ウィジェットインスタンスは毎回作り直すが、状態（`text`, `cursor`, `checked`, `index`, `lines`）は `StateStore` が `id` をキーに保持する。UI ツリーで `value` を渡しても、`controlled: true` でない限り無視される。
-- **GTK**: `App._idmap` が `id → (widget, type)` をフレームをまたいで保持。`apply_ui` の冒頭でキャッシュ済みウィジェットを全 `unparent`、新しい木の中で再 attach。Entry の `set_text` は signal を block して呼び出し、`get_position()` で位置を保存→`set_position(min(pos, len(new)))` で復元する。フレーム終了時に未参照になった id は `destroy()`。`get_focus()` で旧 focus 位置を id 単位で記録し、再描画後に `grab_focus()` で復元。
+- **GTK**: `App._idmap` が `id → (widget, type)` をフレームをまたいで保持。`apply_ui` の冒頭でキャッシュ済みウィジェットを全 `unparent`、新しい木の中で再 attach。Entry の `set_text` は signal を block して呼び出し、`get_position()` で位置を保存→`set_position(min(pos, len(new)))` で復元する。フレーム終了時に未参照になった id は `destroy()`。`get_focus()` で旧 focus 位置と Entry のカーソル位置を id 単位で記録し、再描画後に `grab_focus()` で復元、続けて `select_region(pos, pos)` でカーソル位置を復元しつつ選択を畳む（後述「Entry の select-on-focus」参照）。
 - **Tk**: tkinter は widget の reparenting を許さないので、毎フレーム木全体を作り直す。代わりに、apply 直前に `_capture_state()` で id 単位に `(value, cursor, focused, selected)` をスナップショット → 新しい木をビルドする `_build` 内で id にヒットするキャプチャを参照し、`_restore_input_value` で「focus 中かつ JSON 値と相違 → 旧値優先」「それ以外 → JSON 優先」のルールに従って初期値を決定。Listbox の選択も同様のルールで復元。
 - **Web**: `ensure(existing, node)` が `(_yauiType, _yauiId)` で再利用判定。`reconcileChildren` は親 DOM 内のスロットを順番に更新／追加／削除（React の position-based reconciliation 風）。
 
@@ -104,8 +104,14 @@ textbox/textarea の `value` 上書きには共通ルール:
 
 - バックグラウンドの reader スレッドで stdout をパース → `script.q` に投入
 - `App.consume()` がそれをポーリングして `GLib.idle_add(self.apply_ui, payload)` でメインスレッドへ橋渡し（GTK は必ずメインスレッドから呼ぶ）
-- 毎回 `_replace_child` で window のコンテンツごと差し替えている
+- 毎フレーム、id ベースの reconciliation で `_idmap` のウィジェットを再利用する（`build_widget` が `ctx['cache']` / `ctx['used']` を見ながら create or update を選択）
 - `destroy` シグナルと Esc キーで `close` 発火
+
+#### Entry の select-on-focus（落とし穴）
+
+GTK の `gtk-entry-select-on-focus` 設定はデフォルト `True`。フィルタ系 UI で打鍵 → 再描画 → `grab_focus()` のたびに Entry が「全選択 + カーソル末尾」状態に戻され、次の打鍵で入力が消える現象が起きる。`launcher.sh` がそれを踏んだ。
+
+回避策: `apply_ui` 冒頭で **focus 中の Entry のカーソル位置 (`get_position()`) を保存** → 再描画後 `grab_focus()` の直後に `select_region(pos, pos)` を呼んで選択を畳み、カーソル位置を復元する。`gtk-entry-select-on-focus` 自体は触らない（ユーザーがテーマで True を期待しているかもしれないため、こちらの再描画ロジック側で打ち消す）。
 
 ### yaui-web
 
@@ -146,7 +152,10 @@ textbox/textarea の `value` 上書きには共通ルール:
 - **追加し忘れ**: 1 ランタイムだけに足すと他で `<unknown widget>` が表示される。コミット前に必ず 4 つすべてに反映する
 - **GTK のスレッド境界**: reader スレッドから直接 GTK API を呼ぶと segfault。必ず `GLib.idle_add`
 - **Web の DOM 全再構築**: textbox/textarea の `change` で再描画するとカーソル飛び。デモはこの罠を回避する書き方をしている
-- **再エミット時の `value` 扱い**: TUI は無視、GTK/Web は適用、という非対称をユーザースクリプトに見せないため、`controlled` フラグを使うか、`change` を素直に echo back する。
+- **再エミット時の `value` 扱い**: TUI は無視、GTK/Tk/Web は「focus 中なら適用しない」、という非対称をユーザースクリプトに見せないため、`controlled` フラグを使うか、`change` を素直に echo back する
+- **GTK Entry の select-on-focus**: `grab_focus()` を呼ぶたび全選択になる。再描画後の focus 復元では必ず `select_region(pos, pos)` で畳む（上述）
+- **Tk の reparenting 不可**: tkinter の widget は親を変えられないので、毎フレーム木全体を作り直す前提で書く。状態は `_capture_state` で id 単位にスナップショットし、`_build` 内で復元
+- **タブ閉じ ≠ スクリプト終了**（yaui-web）: `beforeunload` で close を送らない設計。マルチヘッド前提なので、最後のタブが閉じてもスクリプトは生き続ける。明示的に殺す手段（`Quit` ボタン、Ctrl+C）を用意する
 - **JSON エンコード/デコード**: シェルから JSON を扱うときは正規表現で頑張らず `python3 -c '...'` を呼ぶ方が壊れない（`showcase.sh` の `extract` / `json_body` 参照）
 
 ## 規約

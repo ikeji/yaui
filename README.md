@@ -1,8 +1,16 @@
 # yauitoolkit
 
-シェルスクリプト（その他ほとんどの言語）から使える UI ツールキット。同じスクリプトが、ターミナル、デスクトップウィンドウ、ブラウザの 3 つの環境で書き換えなしに動く。
+シェルスクリプト（その他ほとんどの言語）から使える UI ツールキット。同じスクリプトが、ターミナル / デスクトップウィンドウ（GTK・Tkinter）/ ブラウザ で書き換えなしに動く。
 
 スクリプトの仕事はとても単純：JSON の UI ツリーを stdout に書き、JSON のイベントを stdin から読むだけ。
+
+## ショーケース
+
+同一の `showcase.sh` を 3 つのランタイムで動かしたところ:
+
+| TUI (curses) | GTK 3 | Web (SSE) |
+|---|---|---|
+| ![tui](docs/screenshots/tui.png) | ![gtk](docs/screenshots/gtk.png) | ![web](docs/screenshots/web.png) |
 
 ## 起動
 
@@ -56,13 +64,18 @@ read line   # stdin にイベントが届くまで待つ
 
 ## デバッグ
 
-`yaui-gtk --debug script.sh` または `yaui-web --debug script.sh` で、スクリプトから受信した UI ツリーを `[yaui-gtk UI] ...` / `[yaui-web UI] ...` の形で stderr にダンプする。スクリプトの stderr はもともと貫通する（`echo "..." >&2` の出力がそのままターミナルに出る）。
+`yaui-gtk --debug script.sh` / `yaui-tk --debug script.sh` / `yaui-web --debug script.sh` で、スクリプトから受信した UI ツリーを `[yaui-gtk UI] ...` / `[yaui-tk UI] ...` / `[yaui-web UI] ...` の形で stderr にダンプする。スクリプトの stderr はもともと貫通する（`echo "..." >&2` の出力がそのままターミナルに出る）。
+
+## マルチヘッド (yaui-web)
+
+複数タブ・別ブラウザを同時に開いてよい。1 タブで入れた値は他タブに peer event として即座に同期され、リロードしても入力中のテキスト・選択は復元される。詳細は [`PROTOCOL.md`](PROTOCOL.md#yaui-web-のマルチヘッド挙動)。
 
 ## テスト
 
 ```sh
-python3 test_e2e.py     # yaui-tui を pty で起動して操作
-python3 test_gtk.py     # yaui-gtk を Xvfb 上で起動して描画確認
-python3 test_tk.py      # yaui-tk  を Xvfb 上で起動して描画確認
-python3 test_web.py     # yaui-web の HTTP/SSE/POST を curl と urllib で検証
+python3 test_e2e.py            # yaui-tui を pty で起動して操作
+python3 test_gtk.py            # yaui-gtk を Xvfb 上で起動して描画確認
+python3 test_tk.py             # yaui-tk  を Xvfb 上で起動して描画確認
+python3 test_web.py            # yaui-web の HTTP/SSE/POST を curl と urllib で検証
+python3 test_web_multihead.py  # yaui-web のマルチタブ同期 / リロード復元を検証
 ```
